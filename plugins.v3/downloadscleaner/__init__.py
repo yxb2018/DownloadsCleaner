@@ -137,6 +137,11 @@ class DownloadsCleaner(_PluginBase):
         self._verified_extra_text = extra_text
         self.save_data("verified_extra", [h for h in self._to_list(extra_text)])
 
+        # 捕获"立即运行一次"意图：后续规范化写回 onlyonce=False，
+        # 若写回触发同进程重入 init_plugin，重入调用会把 self._onlyonce 置 False，
+        # 提前捕获保证本轮调度意图不丢
+        run_once = self._onlyonce
+
         # 规范化持久化：修正非法组合（目标线低于阈值等），避免表单回显异常值
         try:
             normalized = self._current_config()
@@ -146,12 +151,8 @@ class DownloadsCleaner(_PluginBase):
             pass
 
         # 立即运行一次：3 秒后执行一轮（参考市场插件 onlyonce 模式）
-        if self._onlyonce:
+        if run_once:
             self._onlyonce = False
-            try:
-                self.update_config(self._current_config())
-            except Exception:
-                pass
             self._once_scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._once_scheduler.add_job(
                 func=self._clean,
