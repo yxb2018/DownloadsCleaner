@@ -59,7 +59,7 @@ class DownloadsCleaner(_PluginBase):
     plugin_desc = ("磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务；"
                    "支持目录白名单、保护标签、完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -80,6 +80,7 @@ class DownloadsCleaner(_PluginBase):
     _target_free_gb = 350.0
     _downloaders: List[str] = []          # 空 = 全部已配置下载器
     _clean_dirs: List[str] = ["E:/Downloads"]
+    _exclude_dirs: List[str] = []          # 排除目录：命中即不清理，优先于清理目录
     _block_keywords: List[str] = []
     _min_seeding_days = 15
     _protect_tags: List[str] = ["保种", "H&R"]
@@ -118,6 +119,7 @@ class DownloadsCleaner(_PluginBase):
         self._target_free_gb = self._to_float(config.get("target_free_gb"), 350.0)
         self._downloaders = self._to_list(config.get("downloaders"))
         self._clean_dirs = self._to_list(config.get("clean_dirs")) or ["E:/Downloads"]
+        self._exclude_dirs = self._to_list(config.get("exclude_dirs"))
         self._block_keywords = self._to_list(config.get("block_keywords"))
         self._min_seeding_days = max(0, int(self._to_float(config.get("min_seeding_days"), 15)))
         self._protect_tags = self._to_list(config.get("protect_tags")) or ["保种", "H&R"]
@@ -186,6 +188,7 @@ class DownloadsCleaner(_PluginBase):
             "target_free_gb": max(self._threshold_free_gb, self._target_free_gb),
             "downloaders": self._downloaders,
             "clean_dirs": self._clean_dirs,
+            "exclude_dirs": self._exclude_dirs,
             "block_keywords": self._block_keywords,
             "min_seeding_days": self._min_seeding_days,
             "protect_tags": self._protect_tags,
@@ -352,6 +355,8 @@ class DownloadsCleaner(_PluginBase):
         if not roots:
             logger.error(f"{self.LOG_TAG}未配置有效的清理目录，取消本轮")
             return []
+        # 排除目录优先于清理目录：先算好，命中子树直接跳过
+        exclude_roots = [self._norm_root(d) for d in self._exclude_dirs if str(d).strip()]
 
         transfer_oper = TransferHistoryOper()
         verified_extra = {
@@ -378,7 +383,7 @@ class DownloadsCleaner(_PluginBase):
                 continue
             for torrent in torrents or []:
                 item = self._match_torrent(
-                    torrent, downloader, roots, protected, block_words,
+                    torrent, downloader, roots, exclude_roots, protected, block_words,
                     transfer_oper, verified_extra,
                 )
                 if item:
@@ -388,9 +393,9 @@ class DownloadsCleaner(_PluginBase):
         candidates.sort(key=lambda c: -c["seed_days"])
         logger.info(
             f"{self.LOG_TAG}候选扫描完成：命中 {len(candidates)} 个"
-            f"（目录={'/'.join(roots)}，做种≥{self._min_seeding_days}天，"
-            f"完成保护≥{self._protect_recent_days}天，排除标签={protected or '无'}，"
-            f"要求入库={'开' if self._require_library else '关'}）"
+            f"（目录={'/'.join(roots)}，排除目录={'/'.join(exclude_roots) or '无'}，"
+            f"做种≥{self._min_seeding_days}天，完成保护≥{self._protect_recent_days}天，"
+            f"排除标签={protected or '无'}，要求入库={'开' if self._require_library else '关'}）"
         )
         return candidates
 
@@ -425,6 +430,7 @@ class DownloadsCleaner(_PluginBase):
         torrent: Any,
         downloader: str,
         roots: List[str],
+        exclude_roots: List[str],
         protected: Set[str],
         block_words: List[str],
         transfer_oper: TransferHistoryOper,
@@ -436,6 +442,9 @@ class DownloadsCleaner(_PluginBase):
                 return None
             save_path = str(torrent.get("save_path") or "")
             name = str(torrent.get("name") or torrent_hash)
+            # 排除目录优先：命中排除子树直接跳过（即使位于清理目录内）
+            if exclude_roots and self._in_roots(save_path, exclude_roots):
+                return None
             if not self._in_roots(save_path, roots):
                 return None
             # 路径黑名单
@@ -808,14 +817,22 @@ class DownloadsCleaner(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._col(12, 6, {
+                            self._col(12, 4, {
                                 "component": "VTextarea",
                                 "props": {"model": "clean_dirs",
                                           "label": "清理目录（每行一个，仅这些目录子树内的任务才会被清理）",
                                           "rows": 3, "placeholder": "E:/Downloads",
                                           "hint": "SSD / 保种目录不要加进来", "persistent-hint": True},
                             }),
-                            self._col(12, 6, {
+                            self._col(12, 4, {
+                                "component": "VTextarea",
+                                "props": {"model": "exclude_dirs",
+                                          "label": "排除目录（每行一个，命中即不清理，优先于清理目录）",
+                                          "rows": 3, "placeholder": "E:/Downloads/保种中",
+                                          "hint": "位于清理目录内但需要跳过的子目录，填完整路径前缀",
+                                          "persistent-hint": True},
+                            }),
+                            self._col(12, 4, {
                                 "component": "VTextarea",
                                 "props": {"model": "protect_tags",
                                           "label": "保护标签（命中任一标签的任务不删除，每行一个）",
@@ -885,6 +902,7 @@ class DownloadsCleaner(_PluginBase):
             "target_free_gb": 350,
             "downloaders": [],
             "clean_dirs": "E:/Downloads",
+            "exclude_dirs": "",
             "block_keywords": "",
             "min_seeding_days": 15,
             "protect_tags": "保种\nH&R",
