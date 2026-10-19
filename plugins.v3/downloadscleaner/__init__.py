@@ -4,9 +4,15 @@
 触发条件：监控盘可用空间低于阈值（默认 300 GiB）。
 清理范围：仅配置的下载目录子树（默认 E:/Downloads），天然排除 SSD / 保种专区等其它目录。
 目标条件：任务已完成 + 做种时长 >= 阈值 + 不带保护标签 + 分享率/大小/完成时间达标
-          + 已确认媒体入库（MP 整理记录成功，或额外白名单）。
-清理动作：删除下载器任务（可选连同本地文件、MP 历史记录、空目录回收）；
-          按做种时长从长到短删，直到空间回到目标线或达到单轮上限。
+          + 已确认媒体入库（MP 整理记录成功）。
+清理动作：每轮刷新"待删除列队"（WEBUI 可见），空间低于阈值时才按做种时长从长到短删，
+          直到空间回到目标线或达到单轮上限（可选连同本地文件、MP 历史记录、空目录回收）。
+标签机制（无人值守，每轮自动执行）：
+          ① 带「已入库待确认」标签且 MP 整理记录出现（入库确认）→ 自动移除标签，回归删除列队；
+          ② 清理范围内、已完成、带「已整理」标签但 MP 无整理记录（入库存疑）→ 自动打上
+             「已入库待确认」标签并提示，保护不删；
+          仍受保护的种子形成清单快照，在 WEBUI 顶部与消息通知中持续提示，
+          直到 qB 里不再有该标签为止；用户是否处理都不影响插件运行。
 
 设计参考：
 - MoviePilot V3 官方插件开发规范（app.sdk.* 导入）；
@@ -16,6 +22,7 @@
 
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -34,6 +41,8 @@ from app.schemas.types import NotificationChannel
 
 BS = chr(92)  # 反斜杠，避免源码转义歧义
 GIB = 1024 ** 3
+# MP 整理成功时由 Transfer 链路自动打上的 qB 标签（MP 内置行为，非本插件配置）
+_ORGANIZED_TAG = "已整理"
 
 # 配置里通知渠道名 -> SDK 枚举
 _CHANNEL_MAP = {
@@ -57,9 +66,10 @@ class DownloadsCleaner(_PluginBase):
 
     plugin_name = "下载目录空间清理"
     plugin_desc = ("磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务；"
-                   "支持目录白名单、保护标签、完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
+                   "支持目录白名单、排除目录、保护标签（含未入库保护标签自动打标与解除）、"
+                   "完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.0.3"
+    plugin_version = "2.2.0"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -72,7 +82,8 @@ class DownloadsCleaner(_PluginBase):
     _enabled = False
     _dry_run = True
     _onlyonce = False
-    _notify = True
+    # ⚠️ 配置项属性不能与方法同名（_notify 是发送方法），否则实例属性会覆盖方法导致调用报错
+    _notify_enabled = True
     _notify_channels: List[str] = []
     _cron = "0 */6 * * *"
     _monitor_path = "E:/"
@@ -88,8 +99,9 @@ class DownloadsCleaner(_PluginBase):
     _min_ratio = 0.0
     _min_size_gb = 0.0
     _require_library = True
-    # 强制删除许可：已人工核查入库但 MP 无整理记录的种子 Hash（删除许可，非保护名单）
-    _verified_extra_text = ""
+    # 未入库保护标签：疑似入库失败的种子由插件自动打上该标签获得保护（不删）；
+    # MP 整理记录出现（入库确认）后自动移除——与 MP"整理成功自动打已整理"同原理
+    _unconfirmed_tag = "已入库待确认"
     _delete_files = True
     _delete_history = True
     _clean_empty_dirs = False
@@ -112,7 +124,7 @@ class DownloadsCleaner(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._dry_run = bool(config.get("dry_run", True))
         self._onlyonce = bool(config.get("onlyonce"))
-        self._notify = bool(config.get("notify", True))
+        self._notify_enabled = bool(config.get("notify", True))
         self._notify_channels = self._to_list(config.get("notify_channels"))
         self._cron = str(config.get("cron") or self._cron).strip()
         self._monitor_path = str(config.get("monitor_path") or self._monitor_path).strip() or self._monitor_path
@@ -128,17 +140,14 @@ class DownloadsCleaner(_PluginBase):
         self._min_ratio = max(0.0, self._to_float(config.get("min_ratio"), 0.0))
         self._min_size_gb = max(0.0, self._to_float(config.get("min_size_gb"), 0.0))
         self._require_library = bool(config.get("require_library", True))
+        # 未入库保护标签：命中即保护；MP 整理记录出现（入库确认）后自动移除
+        self._unconfirmed_tag = str(config.get("unconfirmed_tag") or self._unconfirmed_tag).strip()
         self._delete_files = bool(config.get("delete_files", True))
         self._delete_history = bool(config.get("delete_history", True))
         self._clean_empty_dirs = bool(config.get("clean_empty_dirs"))
         self._tag_then_delete = bool(config.get("tag_then_delete"))
         self._delete_tag = str(config.get("delete_tag") or self._delete_tag).strip() or self._delete_tag
         self._max_delete_per_run = max(1, int(self._to_float(config.get("max_delete_per_run"), 30)))
-
-        # 额外白名单种子 Hash：表单文本 -> 插件数据（get_data 读取，跨会话生效）
-        extra_text = str(config.get("verified_extra") or "")
-        self._verified_extra_text = extra_text
-        self.save_data("verified_extra", [h for h in self._to_list(extra_text)])
 
         # 捕获"立即运行一次"意图：后续规范化写回 onlyonce=False，
         # 若写回触发同进程重入 init_plugin，重入调用会把 self._onlyonce 置 False，
@@ -181,7 +190,7 @@ class DownloadsCleaner(_PluginBase):
             "enabled": self._enabled,
             "dry_run": self._dry_run,
             "onlyonce": False,
-            "notify": self._notify,
+            "notify": self._notify_enabled,
             "notify_channels": self._notify_channels,
             "cron": self._cron,
             "monitor_path": self._monitor_path,
@@ -197,7 +206,7 @@ class DownloadsCleaner(_PluginBase):
             "min_ratio": self._min_ratio,
             "min_size_gb": self._min_size_gb,
             "require_library": self._require_library,
-            "verified_extra": self._verified_extra_text,
+            "unconfirmed_tag": self._unconfirmed_tag,
             "delete_files": self._delete_files,
             "delete_history": self._delete_history,
             "clean_empty_dirs": self._clean_empty_dirs,
@@ -248,6 +257,17 @@ class DownloadsCleaner(_PluginBase):
     # ---------------------------------------------------------------- 主流程
 
     def _clean(self):
+        """调度入口：任何异常都记日志，避免整轮被静默终止。"""
+        try:
+            self._run_round()
+        except Exception as err:
+            logger.error(f"{self.LOG_TAG}本轮执行异常终止：{err}", exc_info=True)
+
+    def _run_round(self):
+        # 未入库保护标签维护：一遍扫描（疑似入库失败自动打标 / 入库确认自动摘标），
+        # 与空间状态无关，每轮最先执行（只动标签不动任务，演练模式下同样生效）
+        self._maintain_unconfirmed_tag()
+
         try:
             free_gb = self._free_gb(self._monitor_path)
         except Exception as err:
@@ -257,19 +277,7 @@ class DownloadsCleaner(_PluginBase):
             logger.error(f"{self.LOG_TAG}监控盘路径不可用：{self._monitor_path}")
             return
 
-        if free_gb >= self._threshold_free_gb:
-            logger.info(
-                f"{self.LOG_TAG}{self._monitor_path} 可用空间 {free_gb:.1f}GiB，"
-                f"高于阈值 {self._threshold_free_gb:.0f}GiB，无需清理"
-            )
-            return
-
-        mode = "演练" if self._dry_run else "执行"
-        logger.info(
-            f"{self.LOG_TAG}触发清理（{mode}）：{self._monitor_path} 可用 {free_gb:.1f}GiB "
-            f"< 阈值 {self._threshold_free_gb:.0f}GiB，目标回到 {self._target_free_gb:.0f}GiB"
-        )
-
+        # 待删除列队每轮刷新（WEBUI 展示）；空间不足时才依规则删除
         candidates = self._collect_candidates()
         self.save_data("candidates", candidates[:50])
         self.save_data("disk", {
@@ -279,6 +287,22 @@ class DownloadsCleaner(_PluginBase):
             "target": self._target_free_gb,
             "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+
+        if free_gb >= self._threshold_free_gb:
+            logger.info(
+                f"{self.LOG_TAG}{self._monitor_path} 可用空间 {free_gb:.1f}GiB，"
+                f"高于阈值 {self._threshold_free_gb:.0f}GiB，无需清理；"
+                f"待删除列队 {len(candidates)} 个"
+            )
+            return
+
+        mode = "演练" if self._dry_run else "执行"
+        logger.info(
+            f"{self.LOG_TAG}触发清理（{mode}）：{self._monitor_path} 可用 {free_gb:.1f}GiB "
+            f"< 阈值 {self._threshold_free_gb:.0f}GiB，目标回到 {self._target_free_gb:.0f}GiB，"
+            f"待删除列队 {len(candidates)} 个"
+        )
+
         if not candidates:
             message = (
                 f"{self._monitor_path} 可用空间 {free_gb:.1f}GiB 已低于阈值 "
@@ -360,10 +384,10 @@ class DownloadsCleaner(_PluginBase):
         exclude_roots = [self._norm_root(d) for d in self._exclude_dirs if str(d).strip()]
 
         transfer_oper = TransferHistoryOper()
-        verified_extra = {
-            str(h).strip() for h in (self.get_data("verified_extra") or []) if str(h).strip()
-        }
         protected = {t.strip() for t in self._protect_tags if t.strip()}
+        # 未入库保护标签同样命中即跳过（疑似入库待确认的种子一律不删）
+        if self._unconfirmed_tag:
+            protected.add(self._unconfirmed_tag)
         block_words = [k.strip() for k in self._block_keywords if k.strip()]
         services = self._get_services()
         if not services:
@@ -385,7 +409,7 @@ class DownloadsCleaner(_PluginBase):
             for torrent in torrents or []:
                 item = self._match_torrent(
                     torrent, downloader, roots, exclude_roots, protected, block_words,
-                    transfer_oper, verified_extra,
+                    transfer_oper,
                 )
                 if item:
                     candidates.append(item)
@@ -426,6 +450,175 @@ class DownloadsCleaner(_PluginBase):
             logger.warning(f"{self.LOG_TAG}没有可连接的下载器，取消本轮")
         return active
 
+    # ---------------------------------------------------------------- 未入库保护标签
+
+    def _maintain_unconfirmed_tag(self):
+        """未入库保护标签维护（每轮最先执行，与空间状态无关，演练模式下同样生效）：
+        一遍扫描双方向——疑似入库失败（已整理但无整理记录）自动打标保护，
+        MP 整理记录出现（入库确认）自动摘标回归删除列队；
+        仍受保护的种子形成清单快照，在 WEBUI 顶部与消息通知中持续提示，
+        直到 qB 里不再有该标签为止；用户是否处理都不影响插件运行。"""
+        if not self._unconfirmed_tag:
+            # 标签名为空：清掉历史提示，避免残留
+            if self.get_data("tag_protected"):
+                self.save_data("tag_protected", None)
+            return
+        try:
+            tagged, released, protected, scanned = self._scan_unconfirmed_tag()
+        except Exception as err:
+            logger.warning(f"{self.LOG_TAG}保护标签扫描异常：{err}")
+            return
+        if not scanned:
+            # 没有成功读取过任何下载器（qB 整体不可用）：保留上轮提示，不清空不通知
+            logger.debug(f"{self.LOG_TAG}保护标签扫描未读到下载器，保留上轮提示")
+            return
+
+        # 受保护清单快照更新
+        old_snapshot = self.get_data("tag_protected") or {}
+        old_hashes = {i.get("hash") for i in (old_snapshot.get("items") or [])}
+        new_hashes = {p.get("hash") for p in protected}
+        self.save_data("tag_protected", {
+            "tag": self._unconfirmed_tag,
+            "items": protected,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        if not (tagged or released or old_hashes != new_hashes):
+            return
+        message = f"【{self.plugin_name}】未入库保护标签维护\n"
+        if tagged:
+            message += (f"- {len(tagged)} 个种子疑似入库失败（已整理但无整理记录），"
+                        f"已打保护标签「{self._unconfirmed_tag}」：\n")
+            message += "\n".join(f"  · {name}" for name in tagged) + "\n"
+        if released:
+            message += (f"- {len(released)} 个种子已确认入库，自动移除标签"
+                        f"「{self._unconfirmed_tag}」：\n")
+            message += "\n".join(f"  · {name}" for name in released) + "\n"
+        if protected:
+            names = "、".join(p["name"][:30] for p in protected[:10])
+            message += (f"- 仍受保护 {len(protected)} 个（跳过清理）：{names}"
+                        + (f" 等共 {len(protected)} 个" if len(protected) > 10 else ""))
+        logger.info(
+            f"{self.LOG_TAG}标签维护完成：新保护 {len(tagged)} 个，"
+            f"自动解除 {len(released)} 个，仍受保护 {len(protected)} 个"
+        )
+        self._notify(message)
+
+    def _tag_applied(self, instance: Any, hash_: str) -> bool:
+        """回读种子标签，确认保护标签确实已打上（qB 打标签封装无返回值）。"""
+        try:
+            torrents, error_flag = instance.get_torrents(ids=[hash_])
+        except Exception:
+            return False
+        if error_flag or not torrents:
+            return False
+        tags = {t.strip() for t in str(torrents[0].get("tags") or "").split(",") if t.strip()}
+        return self._unconfirmed_tag in tags
+
+    def _scan_unconfirmed_tag(self) -> Tuple[List[str], List[str], List[Dict[str, Any]], bool]:
+        """未入库保护标签一遍扫描（双方向，无人值守）：
+        ① 带「已入库待确认」标签：MP 整理记录出现（入库确认）→ 自动移除标签，回归删除列队；
+        ② 未带标签：清理范围内、已完成、带 MP「已整理」标签但无整理记录
+           （疑似入库失败）→ 自动打上「已入库待确认」标签保护，并计入提示清单。
+        返回 (新打标签名, 已自动摘标签名, 仍受保护清单, 是否成功读取过下载器)。"""
+        tagged: List[str] = []
+        released: List[str] = []
+        protected: List[Dict[str, Any]] = []
+        scanned = False
+        if not self._unconfirmed_tag:
+            return tagged, released, protected, scanned
+        services = self._get_services()
+        if not services:
+            return tagged, released, protected, scanned
+        transfer_oper = TransferHistoryOper()
+        # ②方向的作用范围：清理目录子树内（排除目录优先），不碰范围外的种子
+        roots = [self._norm_root(d) for d in self._clean_dirs if str(d).strip()]
+        exclude_roots = [self._norm_root(d) for d in self._exclude_dirs if str(d).strip()]
+        protect_tags = {t.strip() for t in self._protect_tags if t.strip()}
+        for downloader, service in services.items():
+            instance = getattr(service, "instance", None)
+            if not instance or not hasattr(instance, "get_torrents"):
+                continue
+            try:
+                torrents, error_flag = instance.get_torrents()
+            except Exception as err:
+                logger.warning(f"{self.LOG_TAG}读取 {downloader} 任务失败：{err}")
+                continue
+            if error_flag:
+                logger.warning(f"{self.LOG_TAG}读取 {downloader} 任务返回错误标志，跳过该下载器")
+                continue
+            scanned = True
+            for torrent in torrents or []:
+                torrent_hash = str(torrent.get("hash") or "").strip()
+                if not torrent_hash:
+                    continue
+                name = str(torrent.get("name") or torrent_hash)
+                tags = {t.strip() for t in str(torrent.get("tags") or "").split(",") if t.strip()}
+                entry = {
+                    "downloader": downloader,
+                    "hash": torrent_hash,
+                    "name": name,
+                    "save_path": str(torrent.get("save_path") or ""),
+                    "seed_days": round(int(torrent.get("seeding_time") or 0) / 86400, 1),
+                    "size": int(torrent.get("size") or 0),
+                }
+                if self._unconfirmed_tag in tags:
+                    # ① 已带保护标签：入库确认→摘除回归删除列队；否则继续保护
+                    if not self._is_in_library(transfer_oper, torrent_hash):
+                        protected.append(entry)
+                        continue
+                    try:
+                        ok = instance.remove_torrents_tag(
+                            ids=[torrent_hash], tag=self._unconfirmed_tag
+                        )
+                    except Exception as err:
+                        logger.warning(f"{self.LOG_TAG}移除保护标签失败 [{name[:60]}]：{err}")
+                        protected.append(entry)
+                        continue
+                    if ok:
+                        released.append(name[:60])
+                        logger.info(
+                            f"{self.LOG_TAG}[{name[:60]}] 已确认入库，自动移除保护标签"
+                            f"「{self._unconfirmed_tag}」"
+                        )
+                        time.sleep(0.3)
+                    else:
+                        protected.append(entry)
+                    continue
+                # ② 未带标签：只处理清理范围内、已完成、带 MP「已整理」标签的种子；
+                #    已带其它保护标签的不重复打标；整理记录在的（入库确认）不动
+                if not roots:
+                    continue
+                save_path = str(torrent.get("save_path") or "")
+                if not self._in_roots(save_path, roots):
+                    continue
+                if exclude_roots and self._in_roots(save_path, exclude_roots):
+                    continue
+                if float(torrent.get("progress") or 0) < 1:
+                    continue
+                if protect_tags & tags:
+                    continue
+                if _ORGANIZED_TAG not in tags:
+                    continue
+                if self._is_in_library(transfer_oper, torrent_hash):
+                    continue
+                try:
+                    instance.set_torrents_tag(ids=[torrent_hash], tags=[self._unconfirmed_tag])
+                except Exception as err:
+                    logger.warning(f"{self.LOG_TAG}打保护标签失败 [{name[:60]}]：{err}")
+                    continue
+                # 回读校验：qB 打标签封装无返回值，避免假成功漏保护
+                if not self._tag_applied(instance, torrent_hash):
+                    logger.warning(f"{self.LOG_TAG}保护标签回读校验未通过 [{name[:60]}]，下轮重试")
+                    continue
+                tagged.append(name[:60])
+                protected.append(entry)
+                logger.info(
+                    f"{self.LOG_TAG}[{name[:60]}] 疑似入库失败（已整理但无整理记录），"
+                    f"已打保护标签「{self._unconfirmed_tag}」"
+                )
+                time.sleep(0.3)
+        return tagged, released, protected, scanned
+
     def _match_torrent(
         self,
         torrent: Any,
@@ -435,7 +628,6 @@ class DownloadsCleaner(_PluginBase):
         protected: Set[str],
         block_words: List[str],
         transfer_oper: TransferHistoryOper,
-        verified_extra: Set[str],
     ) -> Optional[Dict[str, Any]]:
         try:
             torrent_hash = str(torrent.get("hash") or "").strip()
@@ -470,9 +662,9 @@ class DownloadsCleaner(_PluginBase):
             size = int(torrent.get("size") or 0)
             if self._min_size_gb > 0 and size < self._min_size_gb * GIB:
                 return None
-            in_library = torrent_hash in verified_extra
-            if self._require_library and not in_library:
-                in_library = self._is_in_library(transfer_oper, verified_extra, torrent_hash)
+            in_library = False
+            if self._require_library:
+                in_library = self._is_in_library(transfer_oper, torrent_hash)
                 if not in_library:
                     return None
             return {
@@ -491,12 +683,8 @@ class DownloadsCleaner(_PluginBase):
 
     # ---------------------------------------------------------------- 入库核验
 
-    def _is_in_library(
-        self, transfer_oper: TransferHistoryOper, verified_extra: Set[str], torrent_hash: str
-    ) -> bool:
-        """媒体已入库才算可删：整理记录成功，或已验证白名单。"""
-        if torrent_hash in verified_extra:
-            return True
+    def _is_in_library(self, transfer_oper: TransferHistoryOper, torrent_hash: str) -> bool:
+        """媒体已入库才算可删：MP 整理记录成功（目标路径在媒体库内）。"""
         try:
             records = transfer_oper.list_by_hash(torrent_hash) or []
         except Exception as err:
@@ -623,18 +811,23 @@ class DownloadsCleaner(_PluginBase):
             self.save_data("history", history[-100:])
 
     def _notify(self, text: str):
-        if not self._notify:
+        if not self._notify_enabled:
             return
         channels = [c for c in (_CHANNEL_MAP.get(ch) for ch in self._notify_channels) if c]
-        try:
-            self.post_message(
-                channel=channels[0] if channels else None,
-                mtype=NotificationType.SiteMessage,
-                title=f"【{self.plugin_name}】",
-                text=text,
-            )
-        except Exception as err:
-            logger.debug(f"{self.LOG_TAG}通知发送失败：{err}")
+
+        def _send():
+            try:
+                self.post_message(
+                    channel=channels[0] if channels else None,
+                    mtype=NotificationType.SiteMessage,
+                    title=f"【{self.plugin_name}】",
+                    text=text,
+                )
+            except Exception as err:
+                logger.debug(f"{self.LOG_TAG}通知发送失败：{err}")
+
+        # 即发即走：通知通道可能阻塞（网络/渠道不可用），绝不能卡住清理主流程
+        threading.Thread(target=_send, name="DownloadsCleanerNotify", daemon=True).start()
 
     # ---------------------------------------------------------------- 工具
 
@@ -696,10 +889,12 @@ class DownloadsCleaner(_PluginBase):
         except Exception as err:
             logger.warning(f"{self.LOG_TAG}读取通知配置失败：{err}")
 
+        # 表单最顶部：受保护种子提示（动态读取，无受保护种子时不渲染）
+        banner_row = self._tag_banner_row(limit=5)
         return [
             {
                 "component": "VForm",
-                "content": [
+                "content": ([banner_row] if banner_row else []) + [
                     # 第一行：总开关
                     {
                         "component": "VRow",
@@ -842,11 +1037,32 @@ class DownloadsCleaner(_PluginBase):
                             }),
                         ],
                     },
-                    # 第七行：黑名单与白名单
+                    # 第七行：未入库保护标签
                     {
                         "component": "VRow",
                         "content": [
                             self._col(12, 6, {
+                                "component": "VTextField",
+                                "props": {"model": "unconfirmed_tag", "label": "未入库保护标签名",
+                                          "placeholder": "已入库待确认",
+                                          "hint": "清理范围内「已整理但无整理记录」的种子自动打上该标签保护；"
+                                                  "整理记录出现（入库确认）后自动移除",
+                                          "persistent-hint": True},
+                            }),
+                            self._col(12, 6, {
+                                "component": "VAlert",
+                                "props": {"type": "info", "variant": "tonal",
+                                          "text": "标签机制：疑似入库失败（带「已整理」标签但 MP 无整理记录）的种子"
+                                                  "由插件自动打上该标签保护并提示，无需人工维护名单；"
+                                                  "整理记录出现确认入库后插件自动摘除，回归删除列队"},
+                            }),
+                        ],
+                    },
+                    # 第八行：保护关键词
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(12, 12, {
                                 "component": "VTextarea",
                                 "props": {"model": "block_keywords",
                                           "label": "保护关键词（每行一个，路径或名称命中即跳过清理）",
@@ -854,17 +1070,9 @@ class DownloadsCleaner(_PluginBase):
                                           "hint": "注意：这是保护名单（命中不删），不是删除名单",
                                           "persistent-hint": True},
                             }),
-                            self._col(12, 6, {
-                                "component": "VTextarea",
-                                "props": {"model": "verified_extra",
-                                          "label": "强制删除许可 Hash（每行一个，命中的种子允许删除）",
-                                          "rows": 2,
-                                          "hint": "已人工核查确认入库、但 MP 无整理记录的种子 Hash；普通情况留空",
-                                          "persistent-hint": True},
-                            }),
                         ],
                     },
-                    # 第八行：动作开关
+                    # 第九行：动作开关
                     {
                         "component": "VRow",
                         "content": [
@@ -912,7 +1120,7 @@ class DownloadsCleaner(_PluginBase):
             "min_ratio": 0,
             "min_size_gb": 0,
             "require_library": True,
-            "verified_extra": "",
+            "unconfirmed_tag": "已入库待确认",
             "delete_files": True,
             "delete_history": True,
             "clean_empty_dirs": False,
@@ -922,6 +1130,38 @@ class DownloadsCleaner(_PluginBase):
         }
 
     # ---------------------------------------------------------------- 详情页
+
+    def _tag_banner_text(self, limit: int = 0) -> Optional[str]:
+        """受保护种子提示文本（WEBUI 顶部展示）：无受保护种子时返回 None。
+        数据来自每轮标签维护的快照，qB 里标签消失后下一轮自动不再提示。"""
+        snapshot = self.get_data("tag_protected") or {}
+        items = snapshot.get("items") or []
+        if not items or snapshot.get("tag") != self._unconfirmed_tag:
+            return None
+        names = [str(i.get("name") or "")[:40] for i in items]
+        shown = names[:limit] if limit else names
+        text = (f"当前 {len(items)} 个种子带保护标签「{self._unconfirmed_tag}」，已跳过清理："
+                + "、".join(shown))
+        if limit and len(names) > limit:
+            text += f" 等共 {len(items)} 个"
+        text += (f"（数据时间 {snapshot.get('time', '-')}；确认入库后插件自动移除标签，"
+                 f"也可在 qB 手动移除；是否处理都不影响插件运行）")
+        return text
+
+    def _tag_banner_row(self, limit: int = 5) -> Optional[dict]:
+        """设置页表单顶部的受保护种子提示行；无提示内容时返回 None。"""
+        text = self._tag_banner_text(limit=limit)
+        if not text:
+            return None
+        return {
+            "component": "VRow",
+            "content": [
+                self._col(12, 12, {
+                    "component": "VAlert",
+                    "props": {"type": "warning", "variant": "tonal", "text": text},
+                }),
+            ],
+        }
 
     def get_page(self) -> Optional[List[dict]]:
         statistic = self.get_data("statistic") or {}
@@ -967,15 +1207,35 @@ class DownloadsCleaner(_PluginBase):
             },
         })
 
-        blocks: List[dict] = [
+        # 未入库保护标签说明卡（配置态提示；受保护清单见顶部横幅）
+        tag_card = self._col(12, 12, {
+            "component": "VAlert",
+            "props": {
+                "type": "info", "variant": "tonal",
+                "text": (f"未入库保护标签「{self._unconfirmed_tag or '未配置'}」：清理范围内"
+                         f"「已整理但无整理记录」的种子自动打上该标签保护，qB 中命中该标签的种子"
+                         f"一律不删；MP 整理记录出现（入库确认）后自动移除标签，回归删除列队"),
+            },
+        })
+
+        blocks: List[dict] = []
+        # 顶部：受保护种子提示（无受保护种子时不渲染）
+        banner_text = self._tag_banner_text(limit=15)
+        if banner_text:
+            blocks.append({"component": "VRow", "content": [self._col(12, 12, {
+                "component": "VAlert",
+                "props": {"type": "warning", "variant": "tonal", "text": banner_text},
+            })]})
+        blocks.extend([
             {"component": "VRow", "content": cards},
             {"component": "VRow", "content": [disk_card]},
-        ]
+            {"component": "VRow", "content": [tag_card]},
+        ])
 
-        # 当前候选表
+        # 待删除列队表
         if candidates:
             blocks.append(self._table_card(
-                "当前候选（若触发将按做种时长降序清理）",
+                "待删除列队（每轮刷新；空间低于阈值时按做种时长降序清理）",
                 ["名称", "下载器", "大小(GiB)", "做种(天)", "分享率", "目录"],
                 [[
                     {"component": "td", "text": c.get("name", "")[:60]},
@@ -987,7 +1247,11 @@ class DownloadsCleaner(_PluginBase):
                 ] for c in candidates[:30]]
             ))
         else:
-            blocks.append(self._alert_card("当前候选", "暂无候选数据（空间未低于阈值或未到检测周期）", "info"))
+            blocks.append(self._alert_card(
+                "待删除列队",
+                f"暂无符合条件的种子（清理目录：{'/'.join(self._clean_dirs)}，"
+                f"做种≥{self._min_seeding_days}天，要求入库={'开' if self._require_library else '关'}）",
+                "info"))
 
         # 删除历史表
         if history:
