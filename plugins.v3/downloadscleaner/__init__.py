@@ -59,7 +59,7 @@ class DownloadsCleaner(_PluginBase):
     plugin_desc = ("磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务；"
                    "支持目录白名单、保护标签、完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -582,6 +582,8 @@ class DownloadsCleaner(_PluginBase):
 
     def _record_run(self, deleted, freed_bytes, failed, tagged, mode):
         statistic = self.get_data("statistic") or {}
+        # 演练轮的删除为模拟值，只更新本轮展示，不计入累计
+        is_real = mode != "演练"
         statistic.update({
             "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "last_deleted": len(deleted),
@@ -589,8 +591,9 @@ class DownloadsCleaner(_PluginBase):
             "last_failed": failed,
             "last_tagged": len(tagged),
             "last_mode": mode,
-            "total_deleted": int(statistic.get("total_deleted") or 0) + len(deleted),
-            "total_freed_gb": round(float(statistic.get("total_freed_gb") or 0) + freed_bytes / GIB, 2),
+            "total_deleted": int(statistic.get("total_deleted") or 0) + (len(deleted) if is_real else 0),
+            "total_freed_gb": round(float(statistic.get("total_freed_gb") or 0)
+                                    + (freed_bytes / GIB if is_real else 0), 2),
         })
         self.save_data("statistic", statistic)
 
@@ -902,7 +905,12 @@ class DownloadsCleaner(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         statistic = self.get_data("statistic") or {}
-        disk = self.get_data("disk") or {}
+        disk = dict(self.get_data("disk") or {})
+        # 磁盘卡优先展示实时读数，失败时回退最近一次运行的快照
+        live_gb = self._free_gb(self._monitor_path)
+        if live_gb is not None:
+            disk["free_gb"] = round(live_gb, 1)
+            disk["checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "（实时）"
         candidates = self.get_data("candidates") or []
         history = self.get_data("history") or []
 
