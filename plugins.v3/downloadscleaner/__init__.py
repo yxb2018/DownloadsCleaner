@@ -59,7 +59,7 @@ class DownloadsCleaner(_PluginBase):
     plugin_desc = ("磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务；"
                    "支持目录白名单、保护标签、完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.0.2"
+    plugin_version = "2.0.3"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -81,13 +81,14 @@ class DownloadsCleaner(_PluginBase):
     _downloaders: List[str] = []          # 空 = 全部已配置下载器
     _clean_dirs: List[str] = ["E:/Downloads"]
     _exclude_dirs: List[str] = []          # 排除目录：命中即不清理，优先于清理目录
-    _block_keywords: List[str] = []
+    _block_keywords: List[str] = []        # 保护关键词：save_path/name 命中即跳过（保护，非删除名单）
     _min_seeding_days = 15
     _protect_tags: List[str] = ["保种", "H&R"]
     _protect_recent_days = 7
     _min_ratio = 0.0
     _min_size_gb = 0.0
     _require_library = True
+    # 强制删除许可：已人工核查入库但 MP 无整理记录的种子 Hash（删除许可，非保护名单）
     _verified_extra_text = ""
     _delete_files = True
     _delete_history = True
@@ -848,16 +849,17 @@ class DownloadsCleaner(_PluginBase):
                             self._col(12, 6, {
                                 "component": "VTextarea",
                                 "props": {"model": "block_keywords",
-                                          "label": "路径/名称黑名单关键词（每行一个，命中即排除）",
+                                          "label": "保护关键词（每行一个，路径或名称命中即跳过清理）",
                                           "rows": 2, "placeholder": "migration",
+                                          "hint": "注意：这是保护名单（命中不删），不是删除名单",
                                           "persistent-hint": True},
                             }),
                             self._col(12, 6, {
                                 "component": "VTextarea",
                                 "props": {"model": "verified_extra",
-                                          "label": "额外入库白名单种子 Hash（每行一个）",
+                                          "label": "强制删除许可 Hash（每行一个，命中的种子允许删除）",
                                           "rows": 2,
-                                          "hint": "经核查已入库但整理记录缺失的种子 Hash，一般留空",
+                                          "hint": "已人工核查确认入库、但 MP 无整理记录的种子 Hash；普通情况留空",
                                           "persistent-hint": True},
                             }),
                         ],
