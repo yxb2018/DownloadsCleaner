@@ -75,7 +75,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -389,7 +389,7 @@ class PtLibraryCheck(_PluginBase):
             cost_srv = time.time() - t_srv
             collected.append((name, server, stype, items))
 
-            # 第一轮判定：只认「片名完全相同（100）」或「imdb 命中（400）」
+            # 第一轮判定：只认「片名完全相同（100/95）」或「imdb 命中（400）」
             best = self._pick_best_scored(items, names, year, None,
                                          emby=(stype != "plex"), imdb=imdb)
             if dbg is not None:
@@ -398,8 +398,9 @@ class PtLibraryCheck(_PluginBase):
                     "candidates": len(items),
                     "best": (best[0].get("Name") or best[0].get("title")) if best else None,
                     "score": best[1] if best else 0,
+                    "year_conflict": best[2] if best else None,
                 })
-            if best and best[1] >= 100:
+            if best and best[1] >= 95:
                 hit = self._hit_result(name, stype, server, best[0], is_tv,
                                        season, episode, imdb, None)
                 if hit:
@@ -472,6 +473,7 @@ class PtLibraryCheck(_PluginBase):
                 collected[idx] = (name, server, stype, merged)
 
         # 4. 第二轮判定：带上 tmdb_id / 全部片名重新评分
+        suspect: Tuple[Any, int, bool] = (None, 0, False)
         for idx, (name, server, stype, items) in enumerate(collected):
             best = self._pick_best_scored(items, names, year, tmdb_id,
                                          emby=(stype != "plex"), imdb=imdb)
@@ -480,7 +482,13 @@ class PtLibraryCheck(_PluginBase):
                     best[0].get("Name") or best[0].get("title")
                     or best[0].get("originalTitle")) if best else None
                 dbg["servers"][idx]["score2"] = best[1] if best else 0
+                dbg["servers"][idx]["year_conflict2"] = best[2] if best else None
             if not best:
+                continue
+            if not self._accept_score(best[1], best[2]):
+                # 分数不够：不当结论，但留作「疑似」提示（同名不同片最常见）
+                if best[1] > suspect[1]:
+                    suspect = best
                 continue
             hit = self._hit_result(name, stype, server, best[0], is_tv,
                                    season, episode, imdb, matched_by)
@@ -497,6 +505,17 @@ class PtLibraryCheck(_PluginBase):
                 reason += "（只传 imdb 时 Plex 无法定位，请同时传 title）"
             if errors:
                 reason += "（" + "；".join(errors[:2]) + "）"
+            if suspect[0] is not None:
+                s_item, s_score, s_conf = suspect
+                s_name = (s_item.get("Name") or s_item.get("title")
+                          or s_item.get("originalTitle") or "")
+                s_year = s_item.get("ProductionYear") or s_item.get("year") or ""
+                how = "片名相同但年份不符" if s_conf else "片名相近"
+                reason = (f"{how}（库内：{s_name}{(' ' + str(s_year)) if s_year else ''}"
+                          f"，评分 {s_score}），{reason}")
+                if dbg is not None:
+                    dbg["suspect"] = {"name": s_name, "year": s_year,
+                                      "score": s_score, "year_conflict": s_conf}
             out = {"found": False, "reason": reason, "title": title}
         if imdb:
             out["imdb"] = imdb
@@ -1106,7 +1125,17 @@ class PtLibraryCheck(_PluginBase):
             strip = lambda s: re.sub(r"[第S]\s*\d+[季部]?", "", s).replace(" ", "")  # noqa: E731
             if strip(c) == strip(w):
                 best = max(best, 70)
+            # 标点差异不算不同片名：PT 站的 `Avatar Fire and Ash` 在库里常写成
+            # `Avatar: Fire and Ash`，硬比字符串会漏判
+            if best < 95 and len(PtLibraryCheck._bare(c)) >= 2 \
+                    and PtLibraryCheck._bare(c) == PtLibraryCheck._bare(w):
+                best = 95
         return best
+
+    @staticmethod
+    def _bare(text: str) -> str:
+        """去掉标点/空白并转小写，只留字母数字与汉字，用于宽松同名判断。"""
+        return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", (text or "").lower())
 
     @staticmethod
     def _item_imdb(item: dict, emby: bool) -> str:
@@ -1135,11 +1164,12 @@ class PtLibraryCheck(_PluginBase):
 
     def _pick_best_scored(self, items: List[dict], names: List[str], year: Optional[str],
                           tmdb_id: Optional[str], emby: bool,
-                          imdb: str = "") -> Optional[Tuple[dict, int]]:
-        """返回 (条目, 分数)。
+                          imdb: str = "") -> Optional[Tuple[dict, int, bool]]:
+        """返回 (条目, 分数, 年份是否冲突)。
 
-        分数语义：100 = 片名完全相同；>=400 = imdb 身份命中（片名可以不像）；
-        80/70 = 包含/去季号后相同（模糊，需要 tmdb_id 再确认）；
+        分数语义：100 = 片名完全相同；95 = 去掉标点后相同；
+        >=400 = imdb 身份命中（片名可以不像）；>=200 = TMDb 身份命中；
+        80/70 = 包含/去季号后相同（模糊，需年份不冲突才算数）；
         <=0 视为不相关。
         """
         if not items:
@@ -1167,14 +1197,30 @@ class PtLibraryCheck(_PluginBase):
                 score += 200
             if score <= 0:
                 continue
-            if year and cand_year and str(cand_year) != str(year):
+            conflict = bool(year and cand_year and str(cand_year) != str(year))
+            if conflict:
                 # 年份不符先留着，没有更合适的再用
                 score -= 40
-            scored.append((score, it))
+            scored.append((score, it, conflict))
         if not scored:
             return None
         scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1], scored[0][0]
+        return scored[0][1], scored[0][0], scored[0][2]
+
+    @staticmethod
+    def _accept_score(score: int, year_conflict: bool) -> bool:
+        """够不够格认定「在库」。
+
+        第二轮不再无条件接受最高分候选：同名不同片（年份差一年）只有 60 分，
+        之前会被当成库内（实测《Tuner 2025》被判成库内《调音师 2026》）。
+        所以只有「身份确认」或「片名完全/近乎完全相同」直接算，
+        模糊匹配（包含、去季号）必须年份不冲突。
+        """
+        if score >= 200:      # TMDb / IMDb 身份命中
+            return True
+        if score >= 95:       # 片名完全相同（含仅标点差异）
+            return True
+        return score >= 70 and not year_conflict
 
     # ------------------------------------------------------------------
     # 工具
