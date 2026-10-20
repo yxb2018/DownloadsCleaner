@@ -1023,8 +1023,10 @@
       || (typeof document !== 'undefined' ? document : null);
     if (!doc || !doc.querySelector) return 'plain';
     if (el && el.closest && el.closest('.grid')) return 'grid';
-    if (doc.querySelector('table.mainouter')) return 'nexus';
-    if (doc.querySelector('td.outer')) return 'nexus';
+    // NexusPHP 有两代写法：老的是 table.mainouter > tr > td.outer，
+    // 新的（春天 / 猫站）是 main.mainouter > div.outer；两代都用 rowhead/rowfollow
+    if (doc.querySelector('.mainouter')) return 'nexus';
+    if (doc.querySelector('.outer')) return 'nexus';
     return 'plain';
   }
 
