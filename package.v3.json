@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.18",
+    "version": "1.1.19",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.19": "列表页提速：进程级并发闸门 3 → 25（配套油猴 2.3.5 的页内 20 并发 / 50ms 间隔，目标 100 条一页前 20 条 20 秒出结果）；查询从 asyncio.to_thread（默认线程池，线程数 = min(32, CPU+4)，NAS 上不够闸门放行的量）挪到插件专用线程池（32 线程）。同题合并、排队超时、HIGH/NORMAL 优先级逻辑不变。",
       "v1.1.18": "补第二轮命中路径的 sources 收集：实测线上《华颐》第一轮 Emby 名字搜索（英文发布名 vs 库内中文主名）0 候选、imdb 直查也没命中（库内条目没存 imdb id），命中发生在第二轮，而第二轮命中后 Plex 候选仍是 0、sources 为空。现在补搜后若仍有服务器 0 候选，用标题识别（不带 imdb，TMDb zh-CN）拿中文名再对空服务器补搜一次（debug 记 recognize_for_sources.mode=title 与 backfill 明细）；与 1.1.17 的第一轮命中补搜共用同一策略。",
       "v1.1.17": "修 1.1.16 补搜拿不到中文名的问题（debug 实锤 backfill got:0）：带 IMDb 的补搜识别走的是 MP 的 IMDb 源识别，返回的 title 是英文、original_title 是原语言（实测《华颐》= \"Hwayi: A Monster Boy\" + 韩文罗马音），对库内主名是中文的 Plex 毫无用处。现在补搜识别改走标题识别（不带 IMDb，TMDb 按 zh-CN 搜回中文名），失败再退回 IMDb 识别；debug 的 recognize_for_sources 记录 mode=title/imdb。",
       "v1.1.16": "修「两台服务器都有却只显示一个播放按钮」：带 IMDb 的查询里 Emby 直查先命中就返回，TMDb 识别从没跑过；而 Plex 只能按片名搜、库内主名常是中文（实测《华颐：吞噬怪物的孩子》），拿发布名里的英文名永远搜出 0 候选，sources 就漏掉了明明在库的 Plex。现在主命中之后、收 sources 之前，若其它服务器候选为空会先做一次识别拿到中文片名/TMDB ID 再补搜一次（评分时中文名与 tmdb_id 都参与，识别结果记在 debug 的 recognize_for_sources）；只补候选为空的服务器，不重复打扰已命中的。",

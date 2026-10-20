@@ -20,6 +20,7 @@ import inspect
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -164,7 +165,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.18"
+    plugin_version = "1.1.19"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -183,8 +184,14 @@ class PtLibraryCheck(_PluginBase):
     _recognize_timeout = 6
     # 站点域名清单的内存缓存：(时间戳, 载荷)。MP 的站点表不常变，5 分钟足够。
     _sites_cache: Optional[Tuple[float, Dict[str, Any]]] = None
-    # 进程级并发闸门（所有标签页共用）与「同题合并」表
-    _gate = _ConcurrencyGate(3)
+    # 进程级并发闸门（所有标签页共用）与「同题合并」表。
+    # 25 是按「列表页 100 条、前 20 条 20 秒内出结果」的吞吐目标定的：
+    # 单条 lite 命中 ~0.5s / 未命中 ~3-5s，25 并发下 100 条约 20~30s 铺满。
+    _gate = _ConcurrencyGate(25)
+    # 查询专用线程池：check() 是 async，阻塞查询必须扔线程池。
+    # 不用 asyncio.to_thread（走默认池，线程数 = min(32, CPU+4)，
+    # NAS 上常常只有 12 个线程，闸门放行了也没线程干活）。
+    _query_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="PtLibraryCheck")
     _gate_timeout = 25.0
     _flight_lock = threading.Lock()
     _inflight: Dict[str, threading.Event] = {}
@@ -230,9 +237,9 @@ class PtLibraryCheck(_PluginBase):
                 setattr(self, attr, default)
         # 并发上限是进程级的，配置改了立刻对所有标签页生效
         try:
-            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 3)))
+            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 25)))
         except (TypeError, ValueError):
-            self._gate.set_limit(3)
+            self._gate.set_limit(25)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -314,7 +321,7 @@ class PtLibraryCheck(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "max_concurrent",
-                            "label": "并发上限（所有标签页合计，建议 3；0 或空按 3）",
+                            "label": "并发上限（所有标签页合计，建议 25；0 或空按 25）",
                             "type": "number",
                         },
                     },
@@ -515,7 +522,11 @@ class PtLibraryCheck(_PluginBase):
                     "title": title,
                 }}
             try:
-                data = await asyncio.to_thread(
+                # 查询专用线程池（见 _query_pool 注释）：不用 asyncio.to_thread，
+                # 默认池线程数 min(32, CPU+4) 在 NAS 上不够 25 并发闸门放行的量
+                loop = asyncio.get_running_loop()
+                data = await loop.run_in_executor(
+                    self._query_pool,
                     self._query, title, subtitle, season, episode, imdb, is_debug, is_lite,
                 )
             finally:
