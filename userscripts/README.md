@@ -235,7 +235,7 @@ node tests/test_userscript.js           # 19 项
 
 ## 八、部署状态（2026-10-20 实测）
 
-- 插件仓库：`github.com/yxb2018/DownloadsCleaner`（复用现有多插件仓库，
+- 插件仓库：`github.com/yxb2018/MoviePilot-Plugins`（复用现有多插件仓库，
   `plugins.v3/ptlibrarycheck/` + 根索引 `package.v3.json` 内有 `PtLibraryCheck` 条目）
 - 已部署实例（地址略，见下方说明）安装并启用后，接口
   `GET /api/v1/plugin/PtLibraryCheck/check` 实测：

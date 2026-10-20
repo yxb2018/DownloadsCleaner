@@ -1,4 +1,8 @@
-# DownloadsCleaner · 下载目录空间清理
+# yxb2018/MoviePilot-Plugins · MoviePilot V3 插件仓库
+
+本仓库包含两个 MoviePilot V3 插件：**下载目录空间清理（DownloadsCleaner）** 与 **PT 媒体库检测（PtLibraryCheck）**。仓库原名 `DownloadsCleaner`，随着插件数量增加已改名为 `MoviePilot-Plugins`（旧地址由 GitHub 自动跳转，raw 地址不会，请使用新地址）。
+
+## 插件一：下载目录空间清理（DownloadsCleaner）
 
 MoviePilot V3 插件：**磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务**。
 
@@ -112,7 +116,7 @@ MoviePilot V3 插件：**磁盘可用空间低于阈值时，自动清理下载�
 ### 安装
 
 1. 把本仓库加入 MoviePilot 插件市场（`PLUGIN_MARKET` 环境变量，多个仓库逗号分隔）：
-   `https://github.com/yxb2018/DownloadsCleaner`
+   `https://github.com/yxb2018/MoviePilot-Plugins`
 2. 在 WebUI 插件市场搜索「PT媒体库检测」并安装
 3. 油猴脚本侧：新建脚本粘贴脚本全文 → 菜单「① 设置 MP 地址与 API Key」
 
@@ -138,3 +142,13 @@ GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&i
 ## License
 
 MIT
+
+## 规范与发布
+
+- 按官方《MoviePilot 插件开发指南（V3）》约束：插件放在 `plugins.v3/<插件ID小写>/`，
+  元数据写入 `package.v3.json`，`version` / `history` 顶部条目 / 类内 `plugin_version` 三处一致
+  （`python scripts/check_versions.py` 可自检）；
+- 宿主导入走稳定 SDK（`app.sdk.*`），仅保留旧路径兜底以兼容早期 V3 宿主；
+- 两个插件均声明 `release: false`：直接从仓库文件安装，不使用 GitHub Release 压缩包分发
+  （本仓库没有自动打包工作流，声明 release=true 会指向不存在的压缩包）；
+- 测试不放在插件源码目录内（避免市场同步时把测试复制进运行目录）。

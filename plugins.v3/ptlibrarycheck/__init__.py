@@ -21,9 +21,20 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from app.application.mediaserver import MediaServerHelper
+# 官方插件开发指南（V3）：插件应优先从 app.sdk 稳定 SDK 导入，
+# 不要直接依赖 app.application / app.domain 的内部文件位置。
+# 这里保留旧路径兜底，兼容早期 V3 宿主。
+try:
+    from app.sdk.media import MetaInfo
+except ImportError:  # 旧宿主没有 sdk.media 门面时回退
+    from app.domain.metainfo import MetaInfo
+
+try:
+    from app.sdk.services import MediaServerHelper
+except ImportError:  # 旧宿主回退
+    from app.application.mediaserver import MediaServerHelper
+
 from app.chain.media import MediaChain
-from app.domain.metainfo import MetaInfo
 from app.schemas.types import MediaType
 from app.sdk.plugin import _PluginBase
 
@@ -52,9 +63,12 @@ class PtLibraryCheck(_PluginBase):
     """PT 站点媒体库存在性与画质查询。"""
 
     plugin_name = "PT媒体库检测"
-    plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询（复用 MP 已配置的媒体服务器）"
-    plugin_version = "1.1.3"
-    plugin_author = "local"
+    plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
+                  "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
+    plugin_icon = "icons/ptlibrarycheck.png"
+    plugin_version = "1.1.4"
+    plugin_author = "yxb2018"
+    author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
     plugin_order = 100
     plugin_config_prefix = "ptlibrarycheck_"
@@ -101,6 +115,11 @@ class PtLibraryCheck(_PluginBase):
 
     def get_state(self) -> bool:
         return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """不注册远程命令（官方 V3 骨架要求的显式空实现）。"""
+        return []
 
     def get_page(self):
         """无独立详情页，配置表单已够用。"""
@@ -1077,7 +1096,13 @@ class PtLibraryCheck(_PluginBase):
     @staticmethod
     def _log(message: str) -> None:
         try:
-            from app.runtime.log import logger
+            from app.sdk.logging import logger
+        except ImportError:  # 旧宿主回退
+            try:
+                from app.runtime.log import logger
+            except Exception:  # noqa: BLE001 - 日志失败不影响主流程
+                return
+        try:
             logger.info(f"[PT媒体库检测] {message}")
         except Exception:  # noqa: BLE001 - 日志失败不影响主流程
             pass
