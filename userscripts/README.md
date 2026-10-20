@@ -260,6 +260,20 @@ GET /api/v1/plugin/PtLibraryCheck/sites
 同题合并命中时返回体多一个 `coalesced: true`（表示结果来自别的标签页的同一次查询，
 不是自己那份数据的重新计算）。
 
+### 后台标签页的坑（v2.2.6）
+
+Chromium 内核（Chrome / **Edge**）对隐藏标签页会节流定时器——后台 5 分钟后
+`setTimeout` 降到约 1 次/分钟；Edge 还有「睡眠标签页」，超时后整页冻结、
+JS 一行都不跑。表现为：**列表只落地 3~4 条，其余一直「查询中…」**，
+而 MP 侧闸门是空闲的（请求根本没发出去）。
+
+脚本侧的处理：
+
+- 0 延迟调度改用 `MessageChannel`（普通任务，不参与定时器节流），不再靠 `setTimeout` 排队；
+- 后台标签页不再强加 250ms 请求间隔（可见时照旧节流），切回来能立刻追平；
+- 整页冻结（睡眠标签页）是浏览器行为，页内代码无法自救——把 PT 站点加进
+  Edge「设置 → 系统和性能 → 睡眠标签页 → 永不休眠」即可。
+
 排查用：
 
 ```http
@@ -312,10 +326,28 @@ sites: {
 },
 ```
 
-NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标题单元格内的
-副标题）已覆盖这些站；彩虹岛的标签胶囊（`.tag` 官方/独占/DIY/国语/中字/特效）、
-热度角标（`.hot`）与编码圈（`.circle`）会在取副标题前剔掉，否则「官方」「独占」
-会被当成片名候选。个别站徽标位置不对时，调 `collectListItems()` 里的选择器即可。
+### 各站 DOM 差异（2026-10-20 逐站实测）
+
+| 站点 | 列表结构 | 副标题容器 | 取副标题前要剔掉的装饰 | 备注 |
+|---|---|---|---|---|
+| 天空 HDSKY | `table.torrents`，标题在嵌套 `td.embedded` | 整格文本 | `.optiontag` | IMDb 链接覆盖率约 73% |
+| 彩虹岛 CHDBits | `table.torrents`，每行 2 个 `td.embedded` | `font.subtitle` | `.tag` / `.hot` / `.circle` | 列表页**没有** IMDb 链接，只能靠标题+副标题 |
+| 春天 Spring Sunday | `table.torrents` | `div.torrent-smalldescr` | `span.torrent-tag`（CMCTV/官方/中字/HDR10+） | |
+| 猫站 PterClub | `table.torrents` | 整格文本 | `a.chs_tag` | 副标题混着促销倒计时，由 `cleanSubtitle()` 清 |
+| 我堡 OurBits | `table.torrents`，5 个 `td.embedded` | 整格文本 | — | td0 带 `[热门]` 角标与「剩余时间：2月25天」 |
+| 观众 Audiences | `table.torrents torrents-table` | 整格文本 | — | 列表页有 IMDb 链接（约 40%），走 IMDb 直查 |
+| 憨憨 HHanClub | **不是 table**：`div.torrents-table` + `div.torr*` | `div.torrent-info-text-small_name`（截到第一个 `\|` 之前） | — | 详情页**没有 h1**，标题/副标题在 `div.grid` 的「标签 + 值」格里 |
+| 听听歌 TTG | `table#torrent_table`，id 在 `<tr id>` | `<b>` 里 `<br>` 之后 | — | 见下表 |
+
+憨憨的详情页靠 `gridCellByLabel('标题' / '副标题')` 从「标签 + 值」格里取，
+其余站仍走 `h1` + `#subtitle`；两者都失败时退到 `document.title` 引号里的片名。
+
+想验证某站的适配效果（采到几条、命中几条），把页面采集结果喂给插件统计即可：
+
+```bash
+# cdp_dump_items.js 在页面里导出 collectListItems()，再批量查 MP
+MP_KEY=<你的 API Key> node tests/check_items.js items-hh.json
+```
 
 **听听歌 TTG 是例外**，它和 NexusPHP 通用结构完全不同：
 
@@ -338,7 +370,7 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 python tests/test_mp_plugin.py          # 218 项
 
 # 油猴（Node 自带 test runner + jsdom）
-node tests/test_userscript.js           # 37 项
+node tests/test_userscript.js           # 44 项
 ```
 
 当前状态：**255 项全过**。

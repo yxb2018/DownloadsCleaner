@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.2.3
+// @version      2.2.6
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @match        *://*.audiences.me/*
@@ -23,18 +23,48 @@
 // @grant        GM_deleteValue
 // @grant        GM_listValues
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.2.3）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.2.6）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.2.6
+ *   · 修：后台标签页的列表整体卡在「查询中…」（憨憨 100 行只落地 3~4 条，
+ *     我堡/观众/春天/猫站同样症状）。实测 Chrome 对隐藏标签页的 setTimeout
+ *     有节流——后台 5 分钟后降到约 1 次/分钟，而队列的请求间隔正是用
+ *     setTimeout 排的，于是队列停摆（MP 侧闸门却是空闲的，说明请求根本没发出去）。
+ *     现在 0 延迟调度改用 MessageChannel（普通任务，不参与定时器节流），
+ *     并且后台标签页不再强加 minIntervalMs 间隔；可见时照旧节流。
+ *
+ * v2.2.5
+ *   · 修：列表页徽标「一次只出一条」，整页要几分钟才铺满，看起来像卡在「查询中…」。
+ *     根因是 renderList 里逐行 await fillListBadge，把整页串行化了——憨憨 100 行
+ *     只出 3~4 个徽标、且任何一条慢查询都会堵住后面所有行。
+ *     现在先给每一行同步占位「查询中…」，再各自落地；并发上限与请求间隔
+ *     仍由页内队列 queue 统一控制（默认 2 并发 / 250ms）。
+ *
+ * v2.2.4
+ *   · 逐站适配剩余 5 站（2026-10-20 实测 DOM）：
+ *     - 春天(springsunday)：每行两个 td.embedded，副标题在 div.torrent-smalldescr，
+ *       标签是 span.torrent-tag（CMCTV/官方/中字），不剔会当成片名候选
+ *     - 猫站(pterclub)：副标题混着促销倒计时「剩余时间：21时23分」，
+ *       字幕标签是 a.chs_tag；现在按站点清洗
+ *     - 我堡(ourbits)：td0 里带 [热门] 角标与「剩余时间：2月25天」
+ *     - 观众(audiences)：结构与我堡类似，但有 IMDb 链接（覆盖率约 40%），走 IMDb 直查
+ *     - 憨憨(hhanclub)：不是 table，是 div.torrents-table + div.torr* 布局；
+ *       列表副标题在 div.torrent-info-text-small_name（后面接 | 全10集 | 类型 | 导演，
+ *       截到第一个 | 之前）；详情页**没有 h1**，标题/副标题都在 div.grid 的
+ *       「标签 + 值」格子里，靠 gridCellByLabel('标题'/'副标题') 取
+ *   · 新增 cleanSubtitle()：统一清掉促销倒计时、[热门]/[置顶] 角标
  *
  * v2.2.3
  *   · 列表页 / 详情页两级查询（配套插件 1.1.11）：
@@ -226,7 +256,27 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.2.3';
+    return '2.2.6';
+  })();
+
+  /** 不受「后台标签页定时器节流」影响的下一轮调度。
+   *  坑（2026-10-20 实测）：Chrome 对隐藏标签页的 setTimeout 有节流——后台
+   *  5 分钟后降到约 1 次/分钟。列表页 100 行靠 setTimeout 排队时，会表现为
+   *  「只落地 3~4 条、其余永远查询中」，而 MP 侧闸门是空闲的（请求根本没发出）。
+   *  MessageChannel 的 message 事件属于普通任务队列，不参与定时器节流，
+   *  所以这里用它替代 setTimeout 做 0 延迟调度。 */
+  const tick = (() => {
+    // Node 单测里不建通道：未关闭的 MessagePort 会吊住事件循环，测试进程退不出去
+    if (typeof MessageChannel === 'undefined' || typeof document === 'undefined') {
+      return (fn) => setTimeout(fn, 0);
+    }
+    const ch = new MessageChannel();
+    const pending = [];
+    ch.port1.onmessage = () => {
+      const fn = pending.shift();
+      if (fn) fn();
+    };
+    return (fn) => { pending.push(fn); ch.port2.postMessage(0); };
   })();
 
   // 限流队列：全局串行 + 最小间隔 + 两级优先级
@@ -248,8 +298,11 @@
       while (this.running < CONFIG.behavior.concurrency && (this.hot.length || this.tasks.length)) {
         const task = this.hot.length ? this.hot.shift() : this.tasks.shift();
         this.running++;
-        const gap = CONFIG.behavior.minIntervalMs - (Date.now() - this.last);
-        setTimeout(async () => {
+        // 后台标签页不强加请求间隔：反正用户看不到，而 setTimeout 的等待会被
+        // 节流成 1 次/分钟（正是列表页卡死的原因）。并发上限仍由 concurrency 管。
+        const hidden = (typeof document !== 'undefined') && document.hidden === true;
+        const gap = hidden ? 0 : CONFIG.behavior.minIntervalMs - (Date.now() - this.last);
+        const run = async () => {
           try {
             const r = await task.fn();
             task.resolve(r);
@@ -259,7 +312,8 @@
             this.last = Date.now();
             this._next();
           }
-        }, Math.max(gap, 0));
+        };
+        if (gap > 0) setTimeout(run, gap); else tick(run);
       }
     },
   };
@@ -304,7 +358,19 @@
             return;
           }
           let d;
-          try { d = JSON.parse(res.responseText); } catch (e) { reject(new Error('响应不是 JSON')); return; }
+          try {
+            d = JSON.parse(res.responseText);
+          } catch (e) {
+            // 反代 30s 断流时会返回状态 200 + HTML 错误页（实测猫站偶发一条）。
+            // 这不是「未入库」，当可重试处理。
+            const head = String(res.responseText || '').replace(/^\uFEFF?\s*/, '').slice(0, 16).toLowerCase();
+            if (head.indexOf('<!doctype') === 0 || head.indexOf('<html') === 0) {
+              reject(retryable('网关返回 HTML 错误页（多为 30s 超时），稍后重试'));
+            } else {
+              reject(new Error('响应不是 JSON'));
+            }
+            return;
+          }
           if (d && d.success === false) { reject(new Error(d.message || '插件返回失败')); return; }
           resolve(d && d.data ? d.data : d);
         },
@@ -602,6 +668,43 @@
     return collectNexusItems();
   }
 
+  /* ---------------------------------------------------------------------
+   * 各站副标题位置（2026-10-20 实测，逐站抓的 DOM）
+   *   · 春天(sunday)  每行两个 td.embedded，标题在 div.torrent-title，
+   *                   副标题在 div.torrent-smalldescr，标签是 span.torrent-tag
+   *   · 憨憨(hhanclub) 新版前端不是 table，是 div.torrents-table + div.torr*；
+   *                   副标题在 div.torrent-info-text-small_name，
+   *                   后面还接着「| 全10集 | 4K 杜比视界 | 类型: … | 导演: …」
+   *   其余站（HDSKY/CHD/观众/我堡/猫站）用整格文本再清洗即可
+   * ------------------------------------------------------------------- */
+  const SUBTITLE_SPECS = [
+    ['springsunday.net', '.torrent-smalldescr', false],
+    ['hhanclub.net', '.torrent-info-text-small_name', true],   // true = 只取第一个 | 之前
+  ];
+
+  /** 取副标题前要剔掉的装饰元素：站点标签胶囊、促销图标、置顶角标、自己的徽标 */
+  const DECOR_SELECTOR = 'a, script, style, .ptmc-badge, .ptmc-holder, .optiontag, img, '
+    + '.tag, [class^="tag-"], .circle, .hot, .torrent-tag, .chs_tag, .sticky, '
+    + '.pro_free, .pro_2x, [class*="pro_"]';
+
+  /** 副标题清洗：促销倒计时、热门角标这些不是片名，留着只会干扰识别 */
+  function cleanSubtitle(raw) {
+    let t = String(raw || '');
+    t = t.replace(/剩余时间\s*[:：]\s*\S+/g, ' ');
+    t = t.replace(/(^|\s)剩余\s*[:：]\s*\S+/g, ' ');
+    t = t.replace(/[\[【]\s*(热门|置顶|推荐|HOT|Hot|hot)\s*[\]】]/g, ' ');
+    t = t.replace(/\s+/g, ' ').trim();
+    return t.slice(0, 300);
+  }
+
+  function subtitleSpecOf(host) {
+    for (let i = 0; i < SUBTITLE_SPECS.length; i++) {
+      const [domain, sel, cutPipe] = SUBTITLE_SPECS[i];
+      if (hostMatch(host, domain)) return { sel, cutPipe };
+    }
+    return null;
+  }
+
   /** NexusPHP 通用（HDSKY / 彩虹岛 / 春天 / 猫舍 / 观众 / 憨憨 …） */
   function collectNexusItems() {
     const best = new Map();   // torrentId -> { a, title, score }
@@ -622,19 +725,34 @@
       // 副标题：同单元格内链接之外的文本（日期/体积/类型/字幕等）
       // 顺便去掉本脚本自己插入的徽标，避免二次运行时把「库内」混进查询串
       let subtitle = '';
-      const cell = a.closest('td') || a.parentElement;
-      if (cell) {
-        const clone = cell.cloneNode(true);
-        // 站点自己的装饰要在取副标题前剔掉，否则会跟中文片名粘成一片：
-        //   · .optiontag  —— HDSKY 等的标签（Dolby Vision/国语/中字/HDR10）
-        //   · .tag/.hot/.circle —— 彩虹岛(CHD)的标签胶囊（官方/独占/DIY/国语/中字/特效）、
-        //                          热度角标、编码圆圈（h5）；不剔的话「官方」「独占」
-        //                          会被插件当成片名候选，真正的片名反而排到后面
-        clone.querySelectorAll('a, script, style, .ptmc-badge, .ptmc-holder, .optiontag, '
-          + 'img, .tag, [class^="tag-"], .circle, .hot')
-          .forEach((n) => n.remove());
-        subtitle = clone.textContent.replace(/\s+/g, ' ').trim().slice(0, 300);
+      // 1) 有专门容器的站，直接取那一块（比整格文本干净得多）
+      const spec = subtitleSpecOf(location.hostname);
+      if (spec) {
+        const box = row.querySelector(spec.sel);
+        if (box) {
+          const clone = box.cloneNode(true);
+          // 站点自己的装饰要在取副标题前剔掉，否则会跟中文片名粘成一片：
+          //   · .optiontag  —— HDSKY 等的标签（Dolby Vision/国语/中字/HDR10）
+          //   · .tag/.hot/.circle —— 彩虹岛(CHD)的标签胶囊（官方/独占/DIY/国语/中字/特效）、
+          //                          热度角标、编码圆圈（h5）；不剔的话「官方」「独占」
+          //                          会被插件当成片名候选，真正的片名反而排到后面
+          //   · .torrent-tag —— 春天(SSD)的 CMCTV/官方/中字 胶囊
+          //   · .chs_tag    —— 猫站(PterClub)的 中字/英字 标签
+          clone.querySelectorAll(DECOR_SELECTOR).forEach((n) => n.remove());
+          subtitle = clone.textContent.replace(/\s+/g, ' ').trim();
+          if (spec.cutPipe) subtitle = subtitle.split('|')[0];
+        }
       }
+      // 2) 没配容器（或容器没命中）：退回整格文本
+      if (!subtitle) {
+        const cell = a.closest('td') || a.parentElement;
+        if (cell) {
+          const clone = cell.cloneNode(true);
+          clone.querySelectorAll(DECOR_SELECTOR).forEach((n) => n.remove());
+          subtitle = clone.textContent.replace(/\s+/g, ' ').trim();
+        }
+      }
+      subtitle = cleanSubtitle(subtitle);
       out.push({ id, row, link: a, anchor: a, title, subtitle, imdb: imdbOfRow(row) });
     });
     return out;
@@ -703,6 +821,22 @@
   }
 
   /** 详情页：标题 + 副标题 */
+  /** 新版前端（憨憨 HHanClub 等）的「标签 + 值」信息格：
+   *  页面里没有 h1，#top 也不存在，标题/副标题都是 div.grid 里成对的两格。
+   *  label 用去空白、去尾冒号后的文本比较（站点有时写「标题：」）。 */
+  function gridCellByLabel(label) {
+    const nodes = document.querySelectorAll('.grid > div');
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (el.children.length > 1) continue;              // 只要叶子格子
+      const t = (el.textContent || '').replace(/\s+/g, '').replace(/[:：]$/, '');
+      if (t !== label) continue;
+      const v = el.nextElementSibling;
+      if (v) return v;
+    }
+    return null;
+  }
+
   function collectDetailItem() {
     const h1 = document.querySelector('#top h1, h1#top, h1') || document.querySelector('#top');
     let title = h1 ? (h1.textContent || '').trim() : '';
@@ -710,14 +844,42 @@
     let subtitle = '';
     const sub = document.querySelector('#subtitle, .subtitle, font.subtitle');
     if (sub) subtitle = sub.textContent.replace(/\s+/g, ' ').trim();
+
+    // 新版前端（憨憨）：标题 / 副标题 都在「标签 + 值」格子里，没有 h1
+    let anchorEl = h1;
+    if (!title) {
+      const cell = gridCellByLabel('标题');
+      if (cell) {
+        title = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+        // 面板插在整个信息块后面，别插进格子里挤成两列
+        anchorEl = cell.closest('.grid') || cell;
+      }
+    }
+    if (!subtitle) {
+      const cell = gridCellByLabel('副标题');
+      if (cell) {
+        // 「中文名 / 别名 | 全10集 | 4K 杜比视界 | 类型: … | 导演: …」→ 只留片名部分
+        subtitle = (cell.textContent || '').replace(/\s+/g, ' ').trim().split('|')[0];
+      }
+    }
     if (!subtitle) {
       // NexusPHP：标题下方的简介/种子小标题表格
       const tbl = document.querySelector('#top + table, table.main + table, #descr + table');
       if (tbl) subtitle = tbl.textContent.replace(/\s+/g, ' ').trim().slice(0, 300);
     }
+    // 最后的兜底：站点把片名写进了 document.title 的引号里
+    if (!title) {
+      const m = String(document.title || '').match(/["“]([^"”]{6,})["”]/);
+      if (m) title = m[1].trim();
+    }
     if (!title) return null;
     // 详情页同样优先用站点已填的 IMDb
-    return { el: h1 || document.body, title, subtitle, imdb: imdbOfRow(document.body) };
+    return {
+      el: anchorEl || document.body,
+      title,
+      subtitle: cleanSubtitle(subtitle),
+      imdb: imdbOfRow(document.body),
+    };
   }
 
   /* =====================================================================
@@ -884,7 +1046,7 @@
    * ===================================================================== */
   const processed = new WeakSet();
 
-  async function renderList() {
+  function renderList() {
     if (!CONFIG.behavior.listPage) return;
     const items = collectListItems();
     for (const it of items) {
@@ -899,7 +1061,10 @@
       (it.anchor || it.link).insertAdjacentElement('afterend', holder);
       // 标题行 + 副标题合并送检：片名取标题行，分辨率/季集等质量标签全文匹配
       const raw = it.subtitle ? `${it.title}\n${it.subtitle}` : it.title;
-      await fillListBadge(holder, raw, it.imdb, 0);
+      // 千万别 await：整页串行会变成「一次只查一条」——一页 100 行要几分钟才铺满，
+      // 而且任意一条慢查询会把后面所有行的「查询中…」占位都堵住（憨憨 100 行
+      // 只出 3~4 个徽标就是这个原因）。并发上限和请求间隔统一交给页内队列 queue。
+      fillListBadge(holder, raw, it.imdb, 0).catch(() => {});
     }
   }
 
@@ -1046,13 +1211,25 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
+  // 排查用句柄：控制台里可以直接看队列/缓存状态（__ptmc.queue.running 等）。
+  // 只暴露对象引用，不改变任何行为，出问题时不至于只能靠猜。
+  try {
+    // 沙箱里 window 不是页面 window，必须挂到 unsafeWindow 才能在控制台/调试里看到
+    const dbgHost = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    dbgHost.__ptmc = {
+      config: CONFIG, queue, checkCache, resultCache,
+      collectListItems, collectDetailItem, peekCached, cacheKeysOf,
+    };
+  } catch (e) {}
+
   // 供 Node 单测导出
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       CONFIG, BUILTIN_SITES, ADAPTED_SITE_NAMES, hash, badgeHtml, listPendingHtml, listFailHtml,
       listBusyHtml, isBusy, panelHtml, tagsHtml, queue,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
-      collectNexusItems, collectTtgItems, splitByBr,
+      collectNexusItems, collectTtgItems, splitByBr, cleanSubtitle, subtitleSpecOf,
+      gridCellByLabel,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, cacheKeysOf, peekCached, mpKey, renderList, renderDetail,
       hostMatch, loadMpSites, siteExcluded,
