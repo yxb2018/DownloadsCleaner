@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.3.1
+// @version      2.3.3
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @license      MIT
@@ -9,6 +9,7 @@
 // @match        *://*.hdsky.me/*
 // @match        *://*.hhanclub.net/*
 // @match        *://*.hhanclub.top/*
+// @match        *://*.keepfrds.com/*
 // @match        *://*.ourbits.club/*
 // @match        *://*.ptchdbits.co/*
 // @match        *://*.pterclub.com/*
@@ -30,13 +31,27 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.3.1）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.3.3）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.3.3
+ *   · 仅更新发布页说明（不再列出适配站点名单），代码与 v2.3.2 完全一致。
+ *
+ * v2.3.2
+ *   · 详情页面板宽度对齐站点自己的「详情栏目」：渲染后量一次站点原生详情表
+ *     （排除 mainouter 后取 rowhead/colhead 最多的那张），面板设成同样的宽度并
+ *     **居中** —— 站点自己的详情块也是居中摆的（我堡 1200 宽的详情表就居中在
+ *     2282 宽的内容区里），所以是居中对齐，不是把左边缘贴过去。
+ *     各站差得离谱（keepfrds 1680 / 春天 1443 / 我堡 1200 / 观众 1280 / TTG 750），
+ *     而原来的锚点 h1 只反映整块 outer 的宽度。
+ *     顺带修了 nexus 布局 width:100% + padding 溢出（面板比容器宽 25px）。
+ *   · 标签列宽度不再写死 10%，按原生 rowhead 占详情表的比例走（--ptmc-label）。
+ *   · 新增适配站：朋友 KeepFRDS（keepfrds.com）。
  *
  * v2.3.1
  *   · 修 TTG 详情页整页不渲染：TTG 的详情页是 /t/<种子ID>/（列表页才是
@@ -212,6 +227,7 @@
     '观众',             // Audiences
     '憨憨',             // HHanClub
     '听听歌',           // TTG / ToTheGlory
+    '朋友',             // KeepFRDS（MP 站点名是「朋友」）
   ];
 
   // 内置域名（与 ADAPTED_SITE_NAMES 对应），MP 不可达时的兜底
@@ -224,6 +240,7 @@
     'audiences.me',
     'hhanclub.net', 'hhanclub.top',
     'totheglory.im',
+    'keepfrds.com',      // 朋友 KeepFRDS（MP 里是 keepfrds.com / pt.keepfrds.com）
   ];
 
   // 从 MP 站点表里筛出来的适配站域名（loadMpSites 填充）；为空时只用 BUILTIN_SITES
@@ -276,7 +293,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.3.1';
+    return '2.3.2';
   })();
 
   /** 不受「后台标签页定时器节流」影响的下一轮调度。
@@ -921,8 +938,17 @@
   .ptmc-badge.err{background:#fdecea;color:#c0392b;border:1px solid #f5c6c0}
   .ptmc-badge.load{background:#eef4ff;color:#4a6cf7;border:1px solid #d6e2ff}
   .ptmc-badge.wait{background:#fff4e5;color:#a35f00;border:1px solid #f3dbb5}
+  /* 面板宿主占满内容区宽度，面板才能在里面居中；
+     flex-shrink:0 是给「观众」这类把标题栏做成 flex 的站准备的
+     （不写会被挤成 1125，居中就对不上原生 1280 了） */
+  #ptmc-detail{width:100%;flex-shrink:0;box-sizing:border-box}
+  /* box-sizing:border-box 必须有：否则 width:100% + padding 会让面板比站点
+     自己的详情栏目宽出一圈（实测春天 1544 vs 1443） */
   .ptmc-panel{margin:8px 0 12px;padding:10px 12px;border:1px solid #d8dce3;border-radius:6px;
-    background:#fafbfc;font-size:13px;line-height:1.7;font-family:system-ui,"Microsoft YaHei",sans-serif}
+    background:#fafbfc;font-size:13px;line-height:1.7;font-family:system-ui,"Microsoft YaHei",sans-serif;
+    box-sizing:border-box;width:100%}
+  /* 标签列宽度跟随站点原生 rowhead 的比例（--ptmc-label 由脚本量出来再写） */
+  .ptmc-panel td.rowhead{width:var(--ptmc-label,10%)}
   .ptmc-panel .t{font-weight:600;margin-bottom:4px}
   .ptmc-panel .t.in{color:#1a7f37}.ptmc-panel .t.out{color:#8a8f98}.ptmc-panel .t.part{color:#b25e09}
   .ptmc-panel table{border-collapse:collapse;margin-top:4px}
@@ -958,6 +984,14 @@
     s.id = 'ptmc-style';
     s.textContent = STYLE;
     document.head.appendChild(s);
+    // 窗口尺寸变了，站点原生详情区宽度也会变，重新贴一次（只挂一次监听）
+    if (typeof window !== 'undefined' && window.addEventListener && !widthHooked) {
+      widthHooked = true;
+      window.addEventListener('resize', () => {
+        const h = document.getElementById('ptmc-detail');
+        if (h) applyNativeWidth(h);
+      }, { passive: true });
+    }
   }
 
   function tagsHtml(q) {
@@ -1043,6 +1077,75 @@
     return 'plain';
   }
 
+  /* ---- 宽度对齐：让面板跟站点自己的「详情栏目」一样宽 ------------------
+   * 各站的详情区宽度差得离谱，而我们的锚点（h1）往往只反映整块 outer 的宽度：
+   *   春天 1443（h1 1519）｜我堡 1200（h1 2282）｜猫站 972（h1 1240）｜观众 1280
+   * 所以渲染完要量一次站点原生详情表，把面板的宽与左边缘对齐到它。
+   *
+   * 「哪张表才是详情栏目」的判定：
+   *   1) 只认带 rowhead / colhead 的表（≥3 个，排除只有 1~2 个的搜索框）；
+   *   2) 丢掉整页外框 table.mainouter（NexusPHP 的整页框架，rowhead 最多但
+   *      根本不是详情区）；
+   *   3) 剩下的取 rowhead 最多、同数取最宽的那张。
+   *
+   * 两个反例，都别踩：
+   *   · 别用「不套着别的候选表」当判据 —— 春天把「相关种子」表嵌在详情表的
+   *     td.rowfollow 里，真详情表会被当成外层丢掉，只剩 1287 宽；
+   *   · 别把 class 里的 "outer" 一刀切排除 —— keepfrds 的真详情表叫
+   *     #tdetail.outerMost，会被误杀，只剩嵌在里面的 1075 宽的「其他版本」表。
+   * ------------------------------------------------------------------- */
+  function nativeDetailBox(doc) {
+    const d = doc || (typeof document !== 'undefined' ? document : null);
+    if (!d || !d.querySelectorAll) return null;
+    const cands = [];
+    [].slice.call(d.querySelectorAll('table')).forEach((t) => {
+      if (t.closest && t.closest('#ptmc-detail')) return;        // 我们自己的
+      const self = `${t.className || ''} ${t.id || ''}`;
+      if (/mainouter/i.test(self)) return;                       // 整页外框
+      const heads = t.querySelectorAll('td.rowhead, td.colhead').length;
+      if (heads < 3) return;
+      const r = t.getBoundingClientRect ? t.getBoundingClientRect() : null;
+      if (!r || !(r.width >= 300)) return;
+      cands.push({ el: t, rect: r, heads: heads });
+    });
+    if (!cands.length) return null;
+    const pick = cands.sort((a, b) => b.heads - a.heads || b.rect.width - a.rect.width)[0];
+    if (!pick) return null;
+    let labelPct = 0;
+    const h = pick.el.querySelector('td.rowhead');
+    if (h && h.getBoundingClientRect) {
+      const hr = h.getBoundingClientRect();
+      if (hr.width > 0 && pick.rect.width > 0) {
+        labelPct = Math.min(40, Math.max(6, Math.round((hr.width / pick.rect.width) * 100)));
+      }
+    }
+    return {
+      left: Math.round(pick.rect.left),
+      width: Math.round(pick.rect.width),
+      labelPct: labelPct,
+    };
+  }
+
+  /** 把已渲染的面板对齐到站点原生详情栏目（宽 + 左边缘 + 标签列比例）。
+   *  每次 innerHTML 重画后都要再调一次，因为样式是写在面板元素上的。 */
+  function applyNativeWidth(host) {
+    if (!host || !host.querySelector) return;
+    const panel = host.querySelector('.ptmc-panel');
+    if (!panel) return;
+    // 憨憨那类 grid 布局：面板已经横跨站点自己的 .grid，别再压成固定宽度
+    if (panel.getAttribute('data-layout') === 'grid') return;
+    const nb = nativeDetailBox(host.ownerDocument || document);
+    if (!nb) return;
+    panel.style.boxSizing = 'border-box';
+    panel.style.width = `${nb.width}px`;
+    panel.style.maxWidth = 'none';
+    // 居中：站点自己的详情块都是居中摆放的（我堡 1200 宽居中在 2282 的内容区里），
+    // 所以这里也用 auto 外边距居中，而不是把左边缘贴过去
+    panel.style.marginLeft = 'auto';
+    panel.style.marginRight = 'auto';
+    if (nb.labelPct) panel.style.setProperty('--ptmc-label', `${nb.labelPct}%`);
+  }
+
   /** 把 [标签, 值] 行按站点布局拼成 HTML */
   function rowsToHtml(rows, lay, titleHtml) {
     if (lay === 'grid') {
@@ -1054,8 +1157,9 @@
     if (lay === 'nexus') {
       return `<table class="main" border="0" cellspacing="0" cellpadding="5" width="100%">`
         + `<tr><td class="colhead" colspan="2">${titleHtml}</td></tr>`
-        + rows.map(([k, v]) => `<tr><td class="rowhead" width="10%">${k}</td>`
-          + `<td class="rowfollow" width="90%">${v}</td></tr>`).join('')
+        // 标签列宽不再写死 10%：由 --ptmc-label 跟随站点原生 rowhead 的比例
+        + rows.map(([k, v]) => `<tr><td class="rowhead">${k}</td>`
+          + `<td class="rowfollow">${v}</td></tr>`).join('')
         + '</table>';
     }
     return `<div class="t ${''}">${titleHtml}</div><table>`
@@ -1210,6 +1314,7 @@
    * 六、渲染入口
    * ===================================================================== */
   const processed = new WeakSet();
+  let widthHooked = false;
 
   function renderList() {
     if (!CONFIG.behavior.listPage) return;
@@ -1283,6 +1388,7 @@
     // 然后才去补画质 / 季集 / 分集这些「打开了才需要」的信息
     const known = peekCached(raw, d.imdb);
     host.innerHTML = known ? panelHtml(known, raw, true) : panelHtml(null, raw);
+    applyNativeWidth(host);
     // 详情页是你正在看的那条：走 high 优先级，插件侧插队、页内也插队
     await fillDetailPanel(host, raw, d.imdb, 0);
   }
@@ -1291,6 +1397,7 @@
     if (!host.isConnected) return;
     const r = await checkTorrentCached(raw, imdb, 'high');
     host.innerHTML = panelHtml(r, raw);
+    applyNativeWidth(host);          // innerHTML 重画过，宽度要重新贴一次
     if (isBusy(r)) {
       const max = Math.max(0, Number(CONFIG.behavior.busyRetries) || 0);
       if (attempt < max) {
@@ -1391,6 +1498,7 @@
     dbgHost.__ptmc = {
       config: CONFIG, queue, checkCache, resultCache,
       collectListItems, collectDetailItem, peekCached, cacheKeysOf,
+      nativeDetailBox, applyNativeWidth,
     };
   } catch (e) {}
 
@@ -1402,7 +1510,7 @@
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       collectNexusItems, collectTtgItems, splitByBr, cleanSubtitle, subtitleSpecOf,
       gridCellByLabel, detailLayout, rowsToHtml, playButtonsHtml, playButtonHtml,
-      playIconSvg,
+      playIconSvg, nativeDetailBox, applyNativeWidth,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, cacheKeysOf, peekCached, mpKey, renderList, renderDetail,
       hostMatch, loadMpSites, siteExcluded,

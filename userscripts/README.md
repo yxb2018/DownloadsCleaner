@@ -12,7 +12,7 @@
 ---
 
 > **GreasyFork 安装页**：<https://greasyfork.org/zh-CN/scripts/601229>
-> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.0，作者 `yxb2018`）
+> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.3，作者 `yxb2018`，配套插件 ≥ v1.1.13）
 > 发布版本不含任何 MP 地址与 API Key，装好后需在油猴菜单里自行填写。
 
 ---
@@ -316,16 +316,17 @@ GET /api/v1/plugin/PtLibraryCheck/stats
 | 观众 Audiences | `audiences.me` |
 | 憨憨 HHanClub | `hhanclub.net` / `hhanclub.top` |
 | 听听歌 TTG | `totheglory.im`（结构特殊：标题链接 `/t/<id>/`，见下） |
+| 朋友 KeepFRDS | `keepfrds.com`（MP 站点名是「**朋友**」，详情页详情表是 `#tdetail.outerMost`，1680 宽） |
 
 **域名以 MP 站点表为准**：脚本启动时调插件 `GET /api/v1/plugin/PtLibraryCheck/sites`，
-按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空）取出对应域名。
+按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空 / 朋友）取出对应域名。
 所以站点改域名（`hhanclub.top` → `hhanclub.net`）**只需在 MP 里改，脚本不用重新发版**；
 拉不到时退回脚本内置的同名域名清单。
 
 增删适配站改脚本顶部（`ADAPTED_SITE_NAMES` 用 MP 站点名，`BUILTIN_SITES` 是兜底域名）：
 
 ```javascript
-const ADAPTED_SITE_NAMES = ['天空', '彩虹岛', '春天', '猫站', '我堡', '观众', '憨憨', '听听歌'];
+const ADAPTED_SITE_NAMES = ['天空', '彩虹岛', '春天', '猫站', '我堡', '观众', '憨憨', '听听歌', '朋友'];
 sites: {
   extra: ['pt.example.com'],   // 临时启用某域名（站点换了域名但 MP 还没改时用）
   exclude: ['hdsky.me'],       // 临时关掉名单里的某个站（优先级最高）
@@ -344,6 +345,7 @@ sites: {
 | 观众 Audiences | `table.torrents torrents-table` | 整格文本 | — | 列表页有 IMDb 链接（约 40%），走 IMDb 直查 |
 | 憨憨 HHanClub | **不是 table**：`div.torrents-table` + `div.torr*` | `div.torrent-info-text-small_name`（截到第一个 `\|` 之前） | — | 详情页**没有 h1**，标题/副标题在 `div.grid` 的「标签 + 值」格里 |
 | 听听歌 TTG | `table#torrent_table`，id 在 `<tr id>` | `<b>` 里 `<br>` 之后 | — | 见下表 |
+| 朋友 KeepFRDS | NexusPHP 通用 `table.torrents` | 通用副标题格 | — | 详情表 id 是 `tdetail`、class 含 `outerMost` |
 
 憨憨的详情页靠 `gridCellByLabel('标题' / '副标题')` 从「标签 + 值」格里取，
 其余站仍走 `h1` + `#subtitle`；两者都失败时退到 `document.title` 引号里的片名。
@@ -367,19 +369,64 @@ MP_KEY=<你的 API Key> node tests/check_items.js items-hh.json
 所以 `collectListItems()` 按站点分派：TTG 走 `collectTtgItems()`（按 `<tr id>` 取行、
 `splitByBr()` 切标题/中文名、徽标插在 `<b>` 之后避免继承加粗），其余走 `collectNexusItems()`。
 
+> **坑（v2.3.1 修）**：TTG 的**详情页也是 `/t/<id>/`**，不是 `details.php`。
+> `isDetailPage()` 原来只认 `details.php`，结果 TTG 详情页一条都不渲染。
+> 现在额外认「主机是 `totheglory.im` + 路径 `/t/数字`」（限定主机，别站不误判）。
+> 注意 TTG 的 URL **必须带结尾斜杠**（`/t/838439/`），写成 `/t/838439` 站点会返回 404 页面。
+
+### 详情页面板宽度：对齐站点原生详情栏目（v2.3.2）
+
+各站详情页的「详情栏目」宽度差别很大（TTG 只有 750，keepfrds 有 1680），
+而锚点元素（`h1`）只反映整块 `outer` 的宽度，拿它当基准会把面板撑得溢出正文。
+
+所以脚本在渲染后**量一次站点自己的详情表**再定宽：
+
+1. `nativeDetailBox(doc)`：遍历页面所有 `table`，排除
+   - 我们自己的面板（`#ptmc-detail` 内）、
+   - 整页外框（class/id 含 `mainouter`）、
+   - `rowhead`/`colhead` 少于 3 个的（不是详情表）、
+   - 宽度 < 300 的；
+   剩下的按「`rowhead` 数量最多、其次宽度最大」挑一张当基准；
+2. `applyNativeWidth(host)`：把面板 `width` 设成基准表宽度，
+   `margin-left/right: auto` **居中**（站点自己的详情块也是居中摆的——
+   比如我堡 1200 宽的详情表居中在 2282 宽的内容区里，所以不能把左边缘贴过去）；
+3. 顺带读基准表首列 `td.rowhead` 的占比，写进 CSS 变量 `--ptmc-label`，
+   让面板的标签列宽度也跟站点一致（钳在 6%~40%）。
+
+踩过的两个坑：
+
+- 春天站的详情表 `td.rowfollow` 里**嵌了「相关种子」表**（`#krelated`，1287 宽）。
+  早先用「不套着别的候选表」当判据，结果真详情表被当成外层丢掉、选了内嵌表 →
+  改成「排除 `mainouter` 后取 `rowhead` 最多」。
+- keepfrds 的真详情表是 `#tdetail.outerMost`（class 含 `outer`）。
+  一刀切排除含 `outer` 的表会把它误杀 → 收窄成只排 `mainouter`。
+
+实测（面板与原生详情表的 `left`/`width` 完全一致）：
+
+| 站点 | 原生详情表 left/width | 面板 left/width |
+|---|---|---|
+| 朋友 KeepFRDS | 431 / 1680 | 431 / 1680 |
+| 春天 Spring Sunday | 547 / 1443 | 547 / 1443 |
+| 我堡 OurBits | 668 / 1200 | 668 / 1200 |
+| 观众 Audiences | 628 / 1280 | 628 / 1280 |
+| 听听歌 TTG | 893 / 750 | 893 / 750 |
+
+憨憨那种 grid 布局不参与（面板已经横跨站点自己的 `.grid`，会带
+`data-layout="grid"` 标记，`applyNativeWidth` 直接跳过）。
+
 ---
 
 ## 七、测试
 
 ```bash
 # MP 插件（把 MP 模块全打桩，不依赖真实 MP）
-python tests/test_mp_plugin.py          # 218 项
+python tests/test_mp_plugin.py          # 240 项
 
 # 油猴（Node 自带 test runner + jsdom）
-node tests/test_userscript.js           # 44 项
+node tests/test_userscript.js           # 52 项
 ```
 
-当前状态：**255 项全过**。
+当前状态：**292 项全过**。
 
 ---
 
@@ -420,7 +467,16 @@ node tests/test_userscript.js           # 44 项
 
 ## 十、发布到 GreasyFork
 
-**已发布**：<https://greasyfork.org/zh-CN/scripts/601229>（脚本 ID 601229，2026-10-20 上线 v2.3.0）。
+**已发布**：<https://greasyfork.org/zh-CN/scripts/601229>（脚本 ID 601229，2026-10-20 上线 v2.3.0；
+v2.3.1 修 TTG 详情页不渲染；v2.3.2 新增 keepfrds 适配 + 详情页面板按站点原生详情栏目宽度居中对齐；
+v2.3.3 仅改发布页说明，代码与 2.3.2 一致）。
+
+更新版本走 `https://greasyfork.org/zh-CN/scripts/601229/versions/new`。
+
+> **发布页的「附加信息」不要写适配站点名单**：一是没必要，二是容易被站点方注意到。
+> GreasyFork **没有独立的附加信息编辑入口**（`/scripts/<id>/edit`、`/scripts/<id>/additional_info/edit`
+> 都是 404），附加信息只能随新版本一起发——所以要改说明就得升一个小版本。
+> 脚本底部的 by-site 链接是 GreasyFork 按 `@match` 自动生成的，删不掉。
 
 发布页是 `https://greasyfork.org/zh-CN/script_versions/new`（`/scripts/new` 会 404）。
 注意 GreasyFork **要求脚本头声明 `@license`**，否则提交会被拦回「您尚未声明@license」；
