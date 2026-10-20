@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.2.6
+// @version      2.3.0
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @match        *://*.audiences.me/*
@@ -29,13 +29,26 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.2.6）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.3.0）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.3.0
+ *   · 详情页面板跟着站点布局走（不再是一块自带边框的外来卡片）：
+ *     - NexusPHP（天空/彩虹岛/春天/猫站/我堡/观众/TTG）：用站点自己的
+ *       <table class="main"> + td.rowhead / td.rowfollow / td.colhead 渲染，
+ *       看起来就是页面自带的一块字段区
+ *     - 憨憨这类新版前端（div.grid 的「标签 + 值」两列）：面板插进 grid 里，
+ *       grid-column:1/-1 横跨两列，内部也是「标签 + 值」
+ *     - 认不出来时退回原来的卡片（plain）
+ *   · 详情页新增 Plex / Emby / Jellyfin 播放按钮（配套插件 1.1.12）：
+ *     库内才显示；两台服务器都有时两个都给；图标是各自官方配色的内联 SVG
+ *     （Plex #cc7b19 / Emby #52b54b / Jellyfin #aa5cc3），不外链图片。
+ *     链接由插件按媒体服务器配置生成，脚本里不存任何媒体服务器地址或密钥。
  *
  * v2.2.6
  *   · 修：后台标签页的列表整体卡在「查询中…」（憨憨 100 行只落地 3~4 条，
@@ -256,7 +269,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.2.6';
+    return '2.3.0';
   })();
 
   /** 不受「后台标签页定时器节流」影响的下一轮调度。
@@ -902,6 +915,24 @@
   .ptmc-panel table{border-collapse:collapse;margin-top:4px}
   .ptmc-panel td{padding:2px 10px 2px 0;vertical-align:top}
   .ptmc-panel .k{color:#6b7280;white-space:nowrap}
+  /* 详情页面板：grid 布局（憨憨等新版前端）插进站点自己的 .grid 里，横跨两列 */
+  .ptmc-panel[data-layout="grid"]{grid-column:1/-1;display:grid;
+    grid-template-columns:100px calc(100% - 100px - 1.25rem);gap:0 1.25rem;justify-items:start;
+    align-items:start;width:100%;margin:8px 0;padding:8px 10px;
+    border:1px solid #e5e7eb;border-radius:8px;background:#fafbfc}
+  .ptmc-panel[data-layout="grid"] .ptmc-glabel{color:#6b7280;font-size:12px;line-height:1.7}
+  .ptmc-panel[data-layout="grid"] .ptmc-gval{min-width:0}
+  .ptmc-panel[data-layout="nexus"]{width:100%;margin:8px 0}
+  .ptmc-panel[data-layout="nexus"] .ptmc-tag{margin-right:4px}
+  .ptmc-rows{border-collapse:collapse}
+  .ptmc-rows td{padding:1px 10px 1px 0;vertical-align:top}
+  /* 播放按钮（Plex / Emby / Jellyfin） */
+  .ptmc-plays{display:inline-flex;flex-wrap:wrap;gap:6px}
+  .ptmc-play{display:inline-flex;align-items:center;gap:5px;padding:3px 9px 3px 6px;
+    border:1px solid #d8dce3;border-radius:999px;background:#fff;color:#374151;
+    font-size:12px;line-height:1;text-decoration:none;vertical-align:middle}
+  .ptmc-play:hover{border-color:#9aa0a6;background:#f6f7f9;text-decoration:none}
+  .ptmc-play svg{display:block;flex:none}
   .ptmc-tag{display:inline-block;margin-right:4px;padding:0 5px;border-radius:3px;background:#eef1f5;color:#374151;font-size:12px}
   .ptmc-tag.dv{background:#f3e8ff;color:#7c3aed;font-weight:600}
   .ptmc-tag.hdr{background:#e0f2fe;color:#0369a1}
@@ -974,14 +1005,126 @@
     return `<span class="ptmc-badge out" title="${esc(tip)}">未入库</span>`;
   }
 
+  /* ---- 详情页面板排版：跟着站点自己的布局走 -------------------------
+   * 三类：
+   *   nexus —— NexusPHP（天空/彩虹岛/春天/猫站/我堡/观众/TTG…）：
+   *            页面主体是 table.mainouter，字段行是 td.rowhead / td.rowfollow，
+   *            这里就用同样的 <table class="main"> + rowhead/rowfollow 渲染，
+   *            看起来就是站点自己多出来的一块信息。
+   *   grid  —— 憨憨(hhanclub) 这类新版前端：没有 table，主体是 div.grid 的
+   *            「标签 + 值」两列（100px 标签列），面板就插进这个 grid，
+   *            用 grid-column:1/-1 横跨两列，内部同样是「标签 + 值」。
+   *   plain —— 认不出来时的兜底：自带边框的卡片（原来的样子）。
+   * ---------------------------------------------------------------- */
+  function detailLayout(anchor) {
+    const el = anchor || null;
+    // 用锚点自己的 document：单测里会切 document，写死全局 document 会判错
+    const doc = (el && el.ownerDocument)
+      || (typeof document !== 'undefined' ? document : null);
+    if (!doc || !doc.querySelector) return 'plain';
+    if (el && el.closest && el.closest('.grid')) return 'grid';
+    if (doc.querySelector('table.mainouter')) return 'nexus';
+    if (doc.querySelector('td.outer')) return 'nexus';
+    return 'plain';
+  }
+
+  /** 把 [标签, 值] 行按站点布局拼成 HTML */
+  function rowsToHtml(rows, lay, titleHtml) {
+    if (lay === 'grid') {
+      return `<div class="ptmc-glabel">${titleHtml}</div>`
+        + `<div class="ptmc-gval"><table class="ptmc-rows">`
+        + rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')
+        + '</table></div>';
+    }
+    if (lay === 'nexus') {
+      return `<table class="main" border="0" cellspacing="0" cellpadding="5" width="100%">`
+        + `<tr><td class="colhead" colspan="2">${titleHtml}</td></tr>`
+        + rows.map(([k, v]) => `<tr><td class="rowhead" width="10%">${k}</td>`
+          + `<td class="rowfollow" width="90%">${v}</td></tr>`).join('')
+        + '</table>';
+    }
+    return `<div class="t ${''}">${titleHtml}</div><table>`
+      + rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')
+      + '</table>';
+  }
+
+  /* ---- 媒体服务器播放按钮 ----
+   * 库内才给按钮：Plex / Emby / Jellyfin 各按自己的类型显示官方配色图标，
+   * 两台服务器都有（插件返回 sources）就两个都给。
+   * 图标是内联 SVG：脚本不依赖任何外链图片，也不受站点 CSP 影响。 */
+  const PLAY_META = {
+    plex: { label: 'Plex', color: '#cc7b19' },
+    emby: { label: 'Emby', color: '#52b54b' },
+    jellyfin: { label: 'Jellyfin', color: '#aa5cc3' },
+  };
+
+  function playIconSvg(type) {
+    if (type === 'plex') {
+      // Plex 官方标记：竖条 + 上下两根横杠（形似 P）
+      return '<svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">'
+        + '<rect width="32" height="32" rx="7" fill="#cc7b19"/>'
+        + '<g fill="#fff"><rect x="8.5" y="6" width="4.4" height="20" rx="2.2"/>'
+        + '<rect x="8.5" y="6" width="14.5" height="5" rx="2.5"/>'
+        + '<rect x="8.5" y="21" width="14.5" height="5" rx="2.5"/></g></svg>';
+    }
+    if (type === 'emby') {
+      // Emby 官方标记：白色圆环 + 一道横杠（小写 e 的意象）
+      return '<svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">'
+        + '<rect width="32" height="32" rx="7" fill="#52b54b"/>'
+        + '<path fill="#fff" d="M16 6.5a9.5 9.5 0 1 0 0 19 9.5 9.5 0 0 0 0-19zm0 3.6'
+        + 'a5.9 5.9 0 1 1 0 11.8 5.9 5.9 0 0 1 0-11.8z"/>'
+        + '<path fill="#52b54b" d="M6.5 15.1h14.2v1.8H6.5z"/></svg>';
+    }
+    if (type === 'jellyfin') {
+      // Jellyfin 官方标记：双色方块对拼
+      return '<svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">'
+        + '<rect width="32" height="32" rx="7" fill="#aa5cc3"/>'
+        + '<path fill="#fff" d="M7 7h8.4v8.4H7zM16.6 7H25v8.4h-8.4z'
+        + 'M7 16.6h8.4V25H7zM16.6 16.6H25V25h-8.4z"/></svg>';
+    }
+    return '<svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">'
+      + '<rect width="32" height="32" rx="7" fill="#4a6cf7"/>'
+      + '<path fill="#fff" d="M12 9l12 7-12 7z"/></svg>';
+  }
+
+  function playButtonHtml(type, url, server) {
+    if (!url) return '';
+    const meta = PLAY_META[type] || { label: server || '播放', color: '#4a6cf7' };
+    const tip = `在 ${server || meta.label} 中打开${server ? '（' + meta.label + '）' : ''}`;
+    return `<a class="ptmc-play" href="${esc(url)}" target="_blank" rel="noopener noreferrer"`
+      + ` title="${esc(tip)}">${playIconSvg(type)}<span>${esc(meta.label)}</span></a>`;
+  }
+
+  /** 播放按钮组：主命中 + 其它服务器上也有（sources）的都给 */
+  function playButtonsHtml(r) {
+    if (!r || !r.found) return '';
+    const out = [];
+    out.push(playButtonHtml(r.server_type || '', r.play_url, r.server || ''));
+    (r.sources || []).forEach((s) => {
+      out.push(playButtonHtml(s.server_type || '', s.play_url, s.server || ''));
+    });
+    const html = out.filter(Boolean).join('');
+    return html || '';
+  }
+
   /** 详情页面板
-   *  @param {boolean} [partial] 只用列表页已有结论铺的首屏，还在补全细节 */
-  function panelHtml(r, rawTitle, partial) {
-    if (r && r.error) return `<div class="ptmc-panel"><div class="t">媒体库查询失败：${esc(r.error)}</div></div>`;
-    if (!r) return `<div class="ptmc-panel"><div class="t">媒体库查询中…</div></div>`;
+   *  @param {boolean} [partial] 只用列表页已有结论铺的首屏，还在补全细节
+   *  @param {string} [layout]  强制用某种布局（单测用；页面里自动按站点判定） */
+  function panelHtml(r, rawTitle, partial, layout) {
+    const lay = layout || detailLayout(
+      (typeof document !== 'undefined' && document.getElementById)
+        ? (document.getElementById('ptmc-detail') || document.querySelector('h1') || null)
+        : null);
+    if (r && r.error) {
+      return `<div class="ptmc-panel" data-layout="${lay}">`
+        + `<div class="t">媒体库查询失败：${esc(r.error)}</div></div>`;
+    }
+    if (!r) {
+      return `<div class="ptmc-panel" data-layout="${lay}"><div class="t">媒体库查询中…</div></div>`;
+    }
     if (isBusy(r)) {
-      return `<div class="ptmc-panel"><div class="t">媒体库查询排队中…</div>
-        <div style="color:#6b7280;font-size:12px">${esc(r.reason || '同时查询的页面太多，已排队等待')}，稍后自动重试。</div></div>`;
+      return `<div class="ptmc-panel" data-layout="${lay}"><div class="t">媒体库查询排队中…</div>`
+        + `<div style="color:#6b7280;font-size:12px">${esc(r.reason || '同时查询的页面太多，已排队等待')}，稍后自动重试。</div></div>`;
     }
     const head = (rawTitle || '').split('\n')[0];
     if (!r.found) {
@@ -997,9 +1140,9 @@
         rows2.push(['识别补充', `${esc(r.recognized.title)}${r.recognized.original_title && r.recognized.original_title !== r.recognized.title ? ' / ' + esc(r.recognized.original_title) : ''}${r.recognized.tmdb_id ? ` <span style="color:#9aa0a6">TMDB ${esc(r.recognized.tmdb_id)}</span>` : ''}`]);
       }
       rows2.push(['未匹配原因', esc(r.reason || '无匹配')]);
-      return `<div class="ptmc-panel"><div class="t out">✗ 媒体库中未找到该资源</div>
-        <table>${rows2.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table>
-        <div style="color:#9aa0a6;font-size:12px;margin-top:4px">发布名：${esc(head)}</div></div>`;
+      rows2.push(['发布名', `<span style="color:#9aa0a6">${esc(head)}</span>`]);
+      return `<div class="ptmc-panel" data-layout="${lay}">`
+        + rowsToHtml(rows2, lay, '✗ 媒体库中未找到该资源') + '</div>';
     }
     const q = r.quality || {};
     const rows = [];
@@ -1034,11 +1177,18 @@
       rows.push(['在库季集', `<span style="color:#374151">${esc(txt)}</span>`]);
     }
     if (q.path) rows.push(['路径', `<span style="color:#6b7280;word-break:break-all">${esc(q.path)}</span>`]);
+    // 库内才给播放按钮：两台服务器都有（插件返回 sources）就两个都显示
+    const plays = playButtonsHtml(r);
+    if (plays) rows.push(['在库播放', `<span class="ptmc-plays">${plays}</span>`]);
+    if (r.in_servers && r.in_servers.length > 1) {
+      rows.push(['同时在', `<span style="color:#6b7280">${esc(r.in_servers.join('、'))}</span>`]);
+    }
     const hint = partial
       ? '<div style="color:#6b7280;font-size:12px;margin:2px 0 4px">'
         + '列表页已确认在库，正在补全画质 / 季集…</div>'
       : '';
-    return `<div class="ptmc-panel"><div class="t ${state}">媒体库检测</div>${hint}<table>${rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table></div>`;
+    return `<div class="ptmc-panel" data-layout="${lay}">${hint}`
+      + rowsToHtml(rows, lay, `媒体库检测${state === 'part' ? '（缺集）' : ''}`) + '</div>';
   }
 
   /* =====================================================================
@@ -1105,7 +1255,14 @@
     processed.add(d.el);
     const host = document.createElement('div');
     host.id = 'ptmc-detail';
-    d.el.insertAdjacentElement('afterend', host);
+    // 憨憨这类「标签 + 值」网格布局：面板要进到 grid 里才能和站点对齐，
+    // 插在 grid 外面会变成独立一块，跟页面其它字段不对齐
+    const lay = detailLayout(d.el);
+    if (lay === 'grid' && d.el && d.el.classList && d.el.classList.contains('grid')) {
+      d.el.appendChild(host);
+    } else {
+      d.el.insertAdjacentElement('afterend', host);
+    }
     const raw = d.subtitle ? `${d.title}\n${d.subtitle}` : d.title;
     // 列表页那趟已经查过就先用它的结论铺上（不重新问、不重新识别），
     // 然后才去补画质 / 季集 / 分集这些「打开了才需要」的信息
@@ -1229,7 +1386,8 @@
       listBusyHtml, isBusy, panelHtml, tagsHtml, queue,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       collectNexusItems, collectTtgItems, splitByBr, cleanSubtitle, subtitleSpecOf,
-      gridCellByLabel,
+      gridCellByLabel, detailLayout, rowsToHtml, playButtonsHtml, playButtonHtml,
+      playIconSvg,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, cacheKeysOf, peekCached, mpKey, renderList, renderDetail,
       hostMatch, loadMpSites, siteExcluded,

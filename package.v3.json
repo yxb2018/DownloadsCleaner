@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.11",
+    "version": "1.1.12",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.12": "详情页播放按钮：命中结果新增 play_url（媒体服务器自己的网页播放页），Plex 用 /web/index.html#!/server/<machineId>/details、Emby/Jellyfin 用 /web/index.html#!/details?id=；machineId 每台服务器只问一次并进程内缓存。全量查询（lite=0）不再命中第一台服务器就返回，而是把其余服务器也搜完，同一部片在两台服务器上都有时一并返回 sources 列表（server/server_type/item_id/play_url），油猴据此同时显示 Plex 与 Emby 播放按钮；列表页浅查询（lite=1）仍是命中即返回，不多花时间。新增插件配置项 play_link（默认开）可关闭播放链接。",
       "v1.1.11": "列表页/详情页两级查询（lite 浅查询）：列表页只需要知道「在不在库里」，现在传 lite=1 时只用搜索结果本身判断——Plex 不再多拉一次 /library/metadata、Emby 不再拉分集列表与分集画质，剧集也不再算季集，一条查询从最多 3 次媒体服务器请求降到 1 次。详情页打开时才用 lite=0 拿全量（画质/音轨/字幕/路径/季集/缺集），油猴会把列表页已经查到的结论直接铺在详情页面板上，先显示结论再补全细节。lite 与 full 的缓存、同题合并 key 都分开，互不覆盖。",
       "v1.1.10": "多标签页并发治理：油猴每个标签页各跑一份，「同时开 5 个站 = 5 倍并发」页内限流管不住，现在插件进程里加了一道闸——所有 /check 先过闸（默认 3 并发，可在插件配置里改），详情页/手动刷新传 priority=high 插队，列表页默认排队；等满 gate_timeout（默认 25s）就返回 busy=true / timeout=true 并附「排队超时」，不再拖到反代 504。同一部片被多个标签页同时查询时只查一次（single-flight），重复请求直接等结果并带 coalesced=true。新增 GET /stats 看闸门实时状态（limit/active/waiting/peak/rejected）。另：识别调用显式带 cache=True，复用 MP 自己的 TMDb 缓存（TmdbCache），减少重复识别与 TMDb 风控。",
       "v1.1.9": "新增 GET /sites 接口：返回 MP 站点表里的站点名与域名，给油猴判断「当前页面是不是适配站」用——站点改域名（hhanclub.top → .net）只需在 MP 里改，油猴脚本不用跟着发版。域名同时从 domain 字段和 url 主机名推导（去 www.），空域名条目自动跳过；结果在内存里缓存 5 分钟。",

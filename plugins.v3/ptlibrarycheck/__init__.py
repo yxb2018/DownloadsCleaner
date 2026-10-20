@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.11"
+    plugin_version = "1.1.12"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -189,6 +189,11 @@ class PtLibraryCheck(_PluginBase):
     _flight_lock = threading.Lock()
     _inflight: Dict[str, threading.Event] = {}
     _flight_results: Dict[str, Dict[str, Any]] = {}
+    # 是否附带媒体服务器的「在网页里播放」链接（详情页按钮用）
+    _play_link = True
+    # Plex 的 machineIdentifier（每台服务器只问一次，进程内缓存）
+    _plex_mid_lock = threading.Lock()
+    _plex_mid: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -210,6 +215,7 @@ class PtLibraryCheck(_PluginBase):
         except (TypeError, ValueError):
             self._cache_hours = 24
         self._episode_check = bool(config.get("episode_check", True))
+        self._play_link = bool(config.get("play_link", True))
         for attr, key, default in (
             ("_total_timeout", "total_timeout", 20),
             ("_recognize_timeout", "recognize_timeout", 6),
@@ -271,6 +277,13 @@ class PtLibraryCheck(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "play_link",
+                            "label": "返回媒体服务器网页播放链接（详情页显示 Plex / Emby 播放按钮）",
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "cache_hours",
@@ -316,6 +329,7 @@ class PtLibraryCheck(_PluginBase):
             "enabled": False,
             "allow_anonymous": False,
             "episode_check": True,
+            "play_link": True,
             "cache_hours": 24,
             "total_timeout": 20,
             "recognize_timeout": 6,
@@ -668,7 +682,10 @@ class PtLibraryCheck(_PluginBase):
             return _done({"found": False, "reason": "MP 未配置媒体服务器", "title": title})
 
         errors: List[str] = []
-        collected: List[Tuple[str, Any, str, List[dict]]] = []
+        collected: List[Tuple[str, Any, Any, str, List[dict]]] = []
+        # 非浅查询（详情页）时，两台服务器都有同一个片子要一起返回，
+        # 所以第一轮命中后不立刻返回，先把剩余服务器也搜完
+        first_hits: List[Tuple[str, Any, Any, str, dict, int]] = []
         for name, svc in services.items():
             if time.time() > deadline:
                 errors.append(f"{name}: 超出时间预算，跳过")
@@ -689,7 +706,7 @@ class PtLibraryCheck(_PluginBase):
                 errors.append(f"{name}: {err}")
                 continue
             cost_srv = time.time() - t_srv
-            collected.append((name, server, stype, items))
+            collected.append((name, svc, server, stype, items))
 
             # 第一轮判定：只认「片名完全相同（100/95）」或「imdb 命中（400）」
             best = self._pick_best_scored(items, names, year, None,
@@ -703,10 +720,26 @@ class PtLibraryCheck(_PluginBase):
                     "year_conflict": best[2] if best else None,
                 })
             if best and best[1] >= 95:
-                hit = self._hit_result(name, stype, server, best[0], is_tv,
-                                       season, episode, imdb, None, lite=lite)
-                if hit:
-                    return _done(hit)
+                if lite:
+                    # 列表页浅查询：命中就走，别为其它服务器多花时间
+                    hit = self._hit_result(name, svc, server, stype, best[0], is_tv,
+                                           season, episode, imdb, None, lite=True)
+                    if hit:
+                        return _done(hit)
+                else:
+                    first_hits.append((name, svc, server, stype, best[0], best[1]))
+
+        # 2.1 详情页：第一台命中后继续搜完，把其余服务器上一并命中的也带上
+        if first_hits:
+            name, svc, server, stype, item, _score = first_hits[0]
+            hit = self._hit_result(name, svc, server, stype, item, is_tv,
+                                   season, episode, imdb, None)
+            if hit:
+                rest = [(n, s2, srv, st, it, sc) for n, s2, srv, st, it, sc in first_hits[1:]]
+                sources = [self._source_of(n, s2, st, it) for n, s2, _srv, st, it, _sc in rest]
+                sources += self._collect_sources(collected, name, names, year, None, imdb)
+                self._attach_sources(hit, sources)
+                return _done(hit)
             # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
 
         # 3. 第一轮没找准：做一次标题识别（硬超时）补 tmdb_id 与额外片名
@@ -754,7 +787,7 @@ class PtLibraryCheck(_PluginBase):
             if dbg is not None:
                 dbg["extra_names"] = extra_names
             names = names + extra_names
-            for idx, (name, server, stype, items) in enumerate(list(collected)):
+            for idx, (name, svc, server, stype, items) in enumerate(list(collected)):
                 if time.time() > deadline:
                     break
                 try:
@@ -772,11 +805,11 @@ class PtLibraryCheck(_PluginBase):
                         continue
                     seen.add(key)
                     merged.append(it)
-                collected[idx] = (name, server, stype, merged)
+                collected[idx] = (name, svc, server, stype, merged)
 
         # 4. 第二轮判定：带上 tmdb_id / 全部片名重新评分
         suspect: Tuple[Any, int, bool] = (None, 0, False)
-        for idx, (name, server, stype, items) in enumerate(collected):
+        for idx, (name, svc, server, stype, items) in enumerate(collected):
             best = self._pick_best_scored(items, names, year, tmdb_id,
                                          emby=(stype != "plex"), imdb=imdb)
             if dbg is not None and idx < len(dbg["servers"]):
@@ -792,9 +825,13 @@ class PtLibraryCheck(_PluginBase):
                 if best[1] > suspect[1]:
                     suspect = best
                 continue
-            hit = self._hit_result(name, stype, server, best[0], is_tv,
+            hit = self._hit_result(name, svc, server, stype, best[0], is_tv,
                                    season, episode, imdb, matched_by, lite=lite)
             if hit:
+                # 详情页：其余服务器上一并命中的也带上（两个播放按钮）
+                if not lite:
+                    self._attach_sources(hit, self._collect_sources(
+                        collected, name, names, year, tmdb_id, imdb))
                 return _done(hit)
 
         if time.time() > deadline:
@@ -831,7 +868,128 @@ class PtLibraryCheck(_PluginBase):
             out["debug"] = dbg
         return out
 
-    def _hit_result(self, name: str, stype: str, server: Any, best: dict,
+    # ------------------------------------------------------------------
+    # 媒体服务器网页播放链接（详情页的 Plex / Emby 播放按钮）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _svc_host(svc: Any) -> str:
+        """从 ServiceInfo 里取服务器地址。
+
+        MP 各版本把地址放在不同地方（MediaServerConf.config 的 host、模块实例的
+        _host、或直接挂在配置对象上），这里按候选顺序挨个试，取到第一个非空值。
+        拿不到就返回空串 —— 没地址不能编造播放链接。
+        """
+        seen = []
+        conf = getattr(svc, "config", None)
+        for attr in ("host", "url", "address", "play_host", "server"):
+            v = getattr(conf, attr, None)
+            if isinstance(v, str) and v.strip():
+                seen.append(v.strip())
+        cfg = getattr(conf, "config", None)
+        if isinstance(cfg, dict):
+            for key in ("host", "url", "address", "play_host", "server", "server_url"):
+                v = cfg.get(key)
+                if isinstance(v, str) and v.strip():
+                    seen.append(v.strip())
+        inst = getattr(svc, "instance", None)
+        for attr in ("_host", "host", "_url", "url", "_address", "address"):
+            v = getattr(inst, attr, None)
+            if isinstance(v, str) and v.strip():
+                seen.append(v.strip())
+        for v in seen:
+            if v.startswith("http"):
+                return v.rstrip("/")
+        return seen[0].rstrip("/") if seen else ""
+
+    def _plex_machine_id(self, svc: Any) -> str:
+        """Plex 的 machineIdentifier（每台服务器只问一次，进程内缓存）。"""
+        name = str(getattr(svc, "name", None) or "")
+        with self._plex_mid_lock:
+            cached = self._plex_mid.get(name)
+        if cached:
+            return cached
+        mid = ""
+        inst = getattr(svc, "instance", None)
+        if inst is not None:
+            for path in ("/", "/identity"):
+                try:
+                    res = inst.get_data(path)
+                    txt = res.text if hasattr(res, "text") else str(res or "")
+                except Exception:  # noqa: BLE001
+                    continue
+                m = (re.search(r'machineIdentifier="([^"]+)"', txt)
+                     or re.search(r'"machineIdentifier"\s*:\s*"([^"]+)"', txt))
+                if m:
+                    mid = m.group(1)
+                    break
+        if mid and name:
+            with self._plex_mid_lock:
+                self._plex_mid[name] = mid
+        return mid
+
+    def _play_url(self, stype: str, svc: Any, item_id: Any) -> str:
+        """媒体服务器自己的网页播放页（给油猴做「在 Plex / Emby 播放」按钮）。"""
+        if not self._play_link or not item_id:
+            return ""
+        host = self._svc_host(svc)
+        if not host:
+            return ""
+        item_id = str(item_id)
+        if stype == "plex":
+            # Plex Web 必须有 server(machineIdentifier)，否则会停在选择服务器页
+            mid = self._plex_machine_id(svc)
+            if not mid:
+                return ""
+            return (f"{host}/web/index.html#!/server/{mid}"
+                    f"/details?key=/library/metadata/{item_id}")
+        # Emby / Jellyfin 网页端详情页
+        return f"{host}/web/index.html#!/details?id={item_id}"
+
+    def _source_of(self, name: str, svc: Any, stype: str, item: dict) -> Dict[str, Any]:
+        """把「另一台服务器上也有」整理成一个来源条目（只带展示与播放所需字段）。"""
+        item_id = item.get("ratingKey") if stype == "plex" else item.get("Id")
+        return {
+            "server": name,
+            "server_type": stype,
+            "item_id": item_id,
+            "title": item.get("title") or item.get("Name") or "",
+            "year": item.get("year") or item.get("ProductionYear") or "",
+            "play_url": self._play_url(stype, svc, item_id),
+        }
+
+    def _collect_sources(self, collected: List[Tuple[str, Any, Any, str, List[dict]]],
+                         primary: str, names: List[str], year: Optional[str],
+                         tmdb_id: Optional[str], imdb: str) -> List[Dict[str, Any]]:
+        """其余媒体服务器上命中同一个片子的，也一起返回（两台都有就给两个播放按钮）。"""
+        out: List[Dict[str, Any]] = []
+        for name, svc, _server, stype, items in collected:
+            if name == primary or not items:
+                continue
+            best = self._pick_best_scored(items, names, year, tmdb_id,
+                                          emby=(stype != "plex"), imdb=imdb)
+            if not best or best[1] < 95:
+                continue
+            out.append(self._source_of(name, svc, stype, best[0]))
+        return out
+
+    @staticmethod
+    def _attach_sources(hit: Dict[str, Any], sources: List[Dict[str, Any]]) -> None:
+        """把其它服务器的命中挂到结论上（同一台服务器只保留一条，去重排序）。"""
+        seen = {str(hit.get("server") or "")}
+        uniq: List[Dict[str, Any]] = []
+        for src in sources:
+            key = str(src.get("server") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            uniq.append(src)
+        if not uniq:
+            return
+        uniq.sort(key=lambda s: str(s.get("server") or ""))
+        hit["sources"] = uniq
+        hit["in_servers"] = [hit["server"]] + [s["server"] for s in uniq]
+
+    def _hit_result(self, name: str, svc: Any, server: Any, stype: str, best: dict,
                     is_tv: bool, season: Optional[int], episode: Optional[int],
                     imdb: str, matched_by: Optional[str],
                     lite: bool = False) -> Optional[Dict[str, Any]]:
@@ -846,6 +1004,7 @@ class PtLibraryCheck(_PluginBase):
             hit["lite"] = True
         hit["server"] = name
         hit["server_type"] = stype
+        hit["play_url"] = self._play_url(stype, svc, hit.get("item_id"))
         if imdb:
             hit["imdb"] = imdb
         # 命中依据：条目自身带的 imdb 与请求一致 → imdb；否则就是片名
