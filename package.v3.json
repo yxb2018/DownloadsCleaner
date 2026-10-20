@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.16",
+    "version": "1.1.17",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.17": "修 1.1.16 补搜拿不到中文名的问题（debug 实锤 backfill got:0）：带 IMDb 的补搜识别走的是 MP 的 IMDb 源识别，返回的 title 是英文、original_title 是原语言（实测《华颐》= \"Hwayi: A Monster Boy\" + 韩文罗马音），对库内主名是中文的 Plex 毫无用处。现在补搜识别改走标题识别（不带 IMDb，TMDb 按 zh-CN 搜回中文名），失败再退回 IMDb 识别；debug 的 recognize_for_sources 记录 mode=title/imdb。",
       "v1.1.16": "修「两台服务器都有却只显示一个播放按钮」：带 IMDb 的查询里 Emby 直查先命中就返回，TMDb 识别从没跑过；而 Plex 只能按片名搜、库内主名常是中文（实测《华颐：吞噬怪物的孩子》），拿发布名里的英文名永远搜出 0 候选，sources 就漏掉了明明在库的 Plex。现在主命中之后、收 sources 之前，若其它服务器候选为空会先做一次识别拿到中文片名/TMDB ID 再补搜一次（评分时中文名与 tmdb_id 都参与，识别结果记在 debug 的 recognize_for_sources）；只补候选为空的服务器，不重复打扰已命中的。",
       "v1.1.15": "修 1.1.14 取不到 Emby serverId 的问题：Emby 的 get_data 只做 [HOST]/[APIKEY] 占位符替换、不自动拼 host（Plex 的才会），传裸路径 /System/Info/Public 拿不到响应，导致 Emby 的 play_url 变成空、按钮不显示。现在改传完整 URL [HOST]/emby/System/Info/Public?X-Emby-Token=[APIKEY]（端点匿名，token 带上无害），serverId 正常返回。",
       "v1.1.14": "修正 Emby 播放按钮打开黑屏：Emby Web 的 deep link 是 #!/item?id=<id>&serverId=<服务器GUID>，之前拼成了 #!/details?id=（那是 Jellyfin 的路由），Emby 4.x 的 web 客户端不认识，打开就是黑屏；而且不带 serverId 也不行——web 端不知道要连哪台服务器。现在 Emby 会先取 /System/Info/Public 拿服务器 GUID（每台只问一次、进程内缓存），拼出 #!/item?id=<id>&serverId=<GUID>；Jellyfin 保持 #!/details?id= 不变。版本号升级同时让旧的坏链接缓存（24h）自动失效。",

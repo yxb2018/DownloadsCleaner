@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.16"
+    plugin_version = "1.1.17"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -748,12 +748,24 @@ class PtLibraryCheck(_PluginBase):
                 recog_tid = None
                 if backfill and time.time() < deadline:
                     remain3 = deadline - time.time()
+                    # 带 imdb 的识别走 IMDb 源：title 是英文、original_title 是原语言
+                    # （实测《华颐》= "Hwayi: A Monster Boy" + 韩文罗马音），对库内
+                    # 主名是中文的 Plex 毫无用处（debug 实锤 got:0）。这里改走标题
+                    # 识别（不带 imdb，TMDb 按 zh-CN 搜回中文名），失败再退 imdb。
                     info3, timed_out3, cost3 = self._recognize_bounded(
-                        meta, is_tv, imdb,
+                        meta, is_tv, "",
                         timeout=min(float(self._budget("recognize_timeout", 6)), remain3),
                     )
+                    mode3 = "title"
+                    if (info3 is None or timed_out3) and imdb and time.time() < deadline:
+                        info3, timed_out3, cost3 = self._recognize_bounded(
+                            meta, is_tv, imdb,
+                            timeout=min(float(self._budget("recognize_timeout", 6)), remain3),
+                        )
+                        mode3 = "imdb"
                     if dbg is not None:
                         dbg["recognize_for_sources"] = {
+                            "mode": mode3,
                             "cost": round(cost3, 2), "timed_out": timed_out3,
                             "ok": info3 is not None,
                         }
