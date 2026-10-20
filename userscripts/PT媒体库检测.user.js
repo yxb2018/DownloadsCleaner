@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.3.0
+// @version      2.3.1
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @license      MIT
@@ -30,13 +30,19 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.3.0）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.3.1）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.3.1
+ *   · 修 TTG 详情页整页不渲染：TTG 的详情页是 /t/<种子ID>/（列表页才是
+ *     /browse.php），而 isDetailPage() 只认 details.php，于是面板压根不插入。
+ *     现在按「主机是 totheglory.im + 路径 /t/数字」判定（限定主机，别站不误判）。
+ *   · 配套插件 1.1.13 修「列表页显示库内、详情页却显示未找到」。
  *
  * v2.3.0
  *   · 详情页面板跟着站点布局走（不再是一块自带边框的外来卡片）：
@@ -270,7 +276,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.3.0';
+    return '2.3.1';
   })();
 
   /** 不受「后台标签页定时器节流」影响的下一轮调度。
@@ -600,7 +606,13 @@
       || document.querySelector('table.torrents, table#torrenttable') != null;
   }
   function isDetailPage() {
-    return /details\.php/i.test(location.pathname) || /details\.php\?/i.test(location.search);
+    if (/details\.php/i.test(location.pathname) || /details\.php\?/i.test(location.search)) return true;
+    // TTG（totheglory）：详情页是 /t/<种子ID>/，列表页才是 /browse.php
+    // —— 只认 details.php 的话 TTG 详情页一个字都不会渲染。
+    // 限定主机，免得别站恰好也有 /t/123/ 这种路径被误判成详情页
+    if (/\btotheglory\.im$/i.test(location.hostname)
+      && /^\/t\/\d+(?:\/|$)/.test(location.pathname)) return true;
+    return false;
   }
 
   /* ---- 列表页种子行识别 ------------------------------------------------

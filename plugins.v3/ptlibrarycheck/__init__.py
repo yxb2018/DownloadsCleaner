@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.12"
+    plugin_version = "1.1.13"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -758,29 +758,46 @@ class PtLibraryCheck(_PluginBase):
                 }
             if info is not None:
                 matched_by = "imdb" if imdb else "title"
-                if getattr(info, "tmdb_id", None):
-                    tmdb_id = str(info.tmdb_id)
-                recog: Dict[str, Any] = {}
-                for key, attr in (("title", "title"), ("original_title", "original_title")):
-                    value = str(getattr(info, attr, None) or "").strip()
-                    if value and not _IMDB_RE.search(value):
-                        recog[key] = value
-                if tmdb_id:
-                    recog["tmdb_id"] = tmdb_id
+                tid, recog, extra = self._absorb_recognized(info, names)
+                if tid:
+                    tmdb_id = tid
                 if recog:
                     state["recognized"] = recog
                     # MP 连片名都解析不出来时，用识别结果兜底显示（source 标记为 recognize）
                     if not state["label"]:
                         state["label"] = recog.get("title") or recog.get("original_title") or ""
                         state["src"] = "recognize"
-                for value in (getattr(info, "title", None),
-                              getattr(info, "original_title", None)):
-                    value = str(value or "").strip()
-                    # 有些版本识别结果里 title 直接是 imdb id，别拿它当搜索词
-                    if not value or _IMDB_RE.search(value):
-                        continue
-                    if self._informative(value) and value not in names:
-                        extra_names.append(value)
+                extra_names = extra
+
+            # 【关键兜底】IMDb 是「快路径」，不是「唯一路径」。
+            # 站点填的 IMDb 常常指向一条信息不全的条目（实测 tt35521394 只能解出
+            # "Tokyo Taxi"，解不出中文名「东京出租车」），这时识别不会产出任何新片名，
+            # 第二轮就无从补搜 → 明明库里有却报「媒体库无此资源」。
+            # 所以：带 imdb 的识别没给出新片名时，再退回去做一次纯片名识别。
+            if (imdb and meta is not None and not extra_names
+                    and time.time() < deadline):
+                remain2 = deadline - time.time()
+                info2, timed_out2, cost2 = self._recognize_bounded(
+                    meta, is_tv, "",
+                    timeout=min(float(self._budget("recognize_timeout", 6)), remain2),
+                )
+                if dbg is not None:
+                    dbg["recognize_fallback"] = {
+                        "cost": round(cost2, 2), "timed_out": timed_out2,
+                        "ok": info2 is not None,
+                    }
+                if info2 is not None:
+                    matched_by = "title"
+                    tid, recog, extra = self._absorb_recognized(info2, names)
+                    if tid:
+                        tmdb_id = tid
+                    if recog:
+                        state["recognized"] = recog
+                        if not state["label"]:
+                            state["label"] = (recog.get("title")
+                                              or recog.get("original_title") or "")
+                            state["src"] = "recognize"
+                    extra_names = extra
 
         # 3.1 识别给出了新的片名：补搜一次（只有这时才多打几个请求）
         if extra_names:
@@ -1022,6 +1039,33 @@ class PtLibraryCheck(_PluginBase):
             return max(1, int(getattr(self, "_" + key, default) or default))
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _absorb_recognized(info: Any, names: List[str]) -> Tuple[Optional[str], Dict[str, Any], List[str]]:
+        """把一次识别结果拆成 (tmdb_id, recognized 字典, 新的候选片名)。
+
+        抽出来是因为带 imdb 与不带 imdb 会各识别一次，两次都要做同样的吸收。
+        """
+        tmdb_id = None
+        if getattr(info, "tmdb_id", None):
+            tmdb_id = str(info.tmdb_id)
+        recog: Dict[str, Any] = {}
+        for key, attr in (("title", "title"), ("original_title", "original_title")):
+            value = str(getattr(info, attr, None) or "").strip()
+            if value and not _IMDB_RE.search(value):
+                recog[key] = value
+        if tmdb_id:
+            recog["tmdb_id"] = tmdb_id
+        extra: List[str] = []
+        for value in (getattr(info, "title", None),
+                      getattr(info, "original_title", None)):
+            value = str(value or "").strip()
+            # 有些版本识别结果里 title 直接是 imdb id，别拿它当搜索词
+            if not value or _IMDB_RE.search(value):
+                continue
+            if PtLibraryCheck._informative(value) and value not in names and value not in extra:
+                extra.append(value)
+        return tmdb_id, recog, extra
 
     def _recognize_bounded(self, meta: Any, is_tv: bool, imdb: str,
                            timeout: float) -> Tuple[Any, bool, float]:
