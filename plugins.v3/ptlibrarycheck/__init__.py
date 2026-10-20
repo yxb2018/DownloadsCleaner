@@ -165,7 +165,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.19"
+    plugin_version = "1.1.20"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -185,9 +185,15 @@ class PtLibraryCheck(_PluginBase):
     # 站点域名清单的内存缓存：(时间戳, 载荷)。MP 的站点表不常变，5 分钟足够。
     _sites_cache: Optional[Tuple[float, Dict[str, Any]]] = None
     # 进程级并发闸门（所有标签页共用）与「同题合并」表。
-    # 25 是按「列表页 100 条、前 20 条 20 秒内出结果」的吞吐目标定的：
-    # 单条 lite 命中 ~0.5s / 未命中 ~3-5s，25 并发下 100 条约 20~30s 铺满。
-    _gate = _ConcurrencyGate(25)
+    # 10 是压测出来的上游舒适区：25 并发时 Emby 搜索与 TMDb 识别互相拖垮
+    # （4 条 504、8 条预算用尽，命中也从 0.5s 拖到 20s），10 并发仍有拥堵，
+    # 配合下面的识别限流后 miss 才能稳定在预算内返回。
+    _gate = _ConcurrencyGate(10)
+    # 识别限流：实测 6 条并发识别全部 4~6s 超时（单发只要 2.6s）——
+    # 并发识别会让 TMDb/MP 识别链路互相拖垮，还把每条查询的 20s 预算耗光。
+    # 全局最多 2 条同时识别；等不到名额的查询立即放弃识别、按片名搜索结果
+    # 兜底（放弃时 _recognize_bounded 返回 cost=-1，调用方不再排队重试）。
+    _recog_sema = threading.BoundedSemaphore(2)
     # 查询专用线程池：check() 是 async，阻塞查询必须扔线程池。
     # 不用 asyncio.to_thread（走默认池，线程数 = min(32, CPU+4)，
     # NAS 上常常只有 12 个线程，闸门放行了也没线程干活）。
@@ -237,9 +243,9 @@ class PtLibraryCheck(_PluginBase):
                 setattr(self, attr, default)
         # 并发上限是进程级的，配置改了立刻对所有标签页生效
         try:
-            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 25)))
+            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 10)))
         except (TypeError, ValueError):
-            self._gate.set_limit(25)
+            self._gate.set_limit(10)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -321,7 +327,7 @@ class PtLibraryCheck(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "max_concurrent",
-                            "label": "并发上限（所有标签页合计，建议 25；0 或空按 25）",
+                            "label": "并发上限（所有标签页合计，建议 10；0 或空按 10）",
                             "type": "number",
                         },
                     },
@@ -768,7 +774,9 @@ class PtLibraryCheck(_PluginBase):
                         timeout=min(float(self._budget("recognize_timeout", 6)), remain3),
                     )
                     mode3 = "title"
-                    if (info3 is None or timed_out3) and imdb and time.time() < deadline:
+                    # cost<0 = 识别名额忙被放弃：再排队重试也是白等 1s，直接跳过
+                    if ((info3 is None or timed_out3) and cost3 >= 0
+                            and imdb and time.time() < deadline):
                         info3, timed_out3, cost3 = self._recognize_bounded(
                             meta, is_tv, imdb,
                             timeout=min(float(self._budget("recognize_timeout", 6)), remain3),
@@ -853,8 +861,9 @@ class PtLibraryCheck(_PluginBase):
             # "Tokyo Taxi"，解不出中文名「东京出租车」），这时识别不会产出任何新片名，
             # 第二轮就无从补搜 → 明明库里有却报「媒体库无此资源」。
             # 所以：带 imdb 的识别没给出新片名时，再退回去做一次纯片名识别。
+            # cost<0 = 识别名额忙被放弃：不重试，重试也是白等。
             if (imdb and meta is not None and not extra_names
-                    and time.time() < deadline):
+                    and cost >= 0 and time.time() < deadline):
                 remain2 = deadline - time.time()
                 info2, timed_out2, cost2 = self._recognize_bounded(
                     meta, is_tv, "",
@@ -1238,12 +1247,20 @@ class PtLibraryCheck(_PluginBase):
 
     def _recognize_bounded(self, meta: Any, is_tv: bool, imdb: str,
                            timeout: float) -> Tuple[Any, bool, float]:
-        """带硬超时的识别。
+        """带硬超时 + 全局限流的识别。
 
         识别（TMDb/TVDB）遇到综艺/直播/体育这类片名会一路重试到几十秒，
         直接把整个请求拖过反代 30s 上限。放到后台线程里跑，到点就走人：
         超时后线程自行结束（daemon），主流程照常用片名搜索兜底。
+
+        并发识别会互相拖垮（实测 6 条并发全部 6s 超时，单发 2.6s），
+        所以进程内最多 2 条同时识别；等不到名额就立即放弃（返回 cost=-1，
+        调用方据此不再排队重试），名额在线程内部释放——超时的 daemon 线程
+        还在打 TMDb 时名额不归还，避免上游请求越堆越多。
         """
+        # 最多等 1s：拿不到说明识别通道正忙，排队只会把查询预算烧光
+        if not self._recog_sema.acquire(timeout=1.0):
+            return None, True, -1.0
         box: Dict[str, Any] = {}
         t0 = time.time()
 
@@ -1252,6 +1269,8 @@ class PtLibraryCheck(_PluginBase):
                 box["r"] = self._recognize(meta, is_tv, imdb)
             except Exception as err:  # noqa: BLE001 - 识别失败不是致命错误
                 box["e"] = err
+            finally:
+                self._recog_sema.release()
 
         th = threading.Thread(target=_run, name="ptmc-recognize", daemon=True)
         th.start()
