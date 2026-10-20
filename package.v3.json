@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.2": "查询加了时间预算，解决反代 30s 断流导致的「查询失败」：先只用本地解析的片名搜媒体服务器（命中片名完全相同/imdb 即返回，不碰 TMDb），没找准才做标题识别且硬超时 6s，超时照样给结论；总预算 20s，超时返回 retryable 而不写缓存。同时修掉碎片名误判——MP 把直播/体育标题解析成 \"The\" 这类碎片时会包含匹配到无关条目（实测把 CCTV5 开幕式误标成库内《The Adventurers》），现在短于信息量的名字不参与匹配。新增 total_timeout / recognize_timeout 配置与 debug=1 诊断参数。",
       "v1.1.1": "修复 IMDb 识别在旧版 MP（3.0.x 的 recognize_by_meta(metainfo=...)）上静默失败的问题：改为按函数签名自适应传参，不再硬编码参数名；只传 imdb 不传标题且媒体服务器是 Plex 时，返回明确的提示原因而不是笼统的「媒体库无此资源」。",
       "v1.1.0": "识别优先用 IMDb：新增 imdb 参数（tt1234567，兼容完整 IMDb 链接），有 imdb 时先走 MediaChain 的 IMDb 身份识别，Emby/Jellyfin 直接用 AnyProviderIdEquals=imdb.ttXXXX 定条目、省掉按片名搜索，Plex 用 imdb 给候选加权；没有 imdb 才退回标题识别。返回值新增 imdb / matched_by 便于前端展示识别方式。",
       "v1.0.0": "初始版本：/check 接口支持电影/剧集存在性、在库版本画质（分辨率/杜比视界/HDR/编码/音轨/字幕/路径）与分集在库情况"

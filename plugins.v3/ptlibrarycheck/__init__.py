@@ -16,6 +16,7 @@
 
 import inspect
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -52,7 +53,7 @@ class PtLibraryCheck(_PluginBase):
 
     plugin_name = "PT媒体库检测"
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询（复用 MP 已配置的媒体服务器）"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "local"
     plugin_label = "媒体库"
     plugin_order = 100
@@ -64,6 +65,10 @@ class PtLibraryCheck(_PluginBase):
     _allow_anonymous = False
     _cache_hours = 24
     _episode_check = True
+    # 时间预算（秒）：油猴脚本走反代，反代对单个请求有 30s 硬上限，
+    # 超了就是 504（前端表现为 network error）。所以必须自己先收手。
+    _total_timeout = 20
+    _recognize_timeout = 6
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -74,6 +79,8 @@ class PtLibraryCheck(_PluginBase):
         self._allow_anonymous = False
         self._cache_hours = 24
         self._episode_check = True
+        self._total_timeout = 20
+        self._recognize_timeout = 6
         if not config:
             return
         self._enabled = bool(config.get("enabled"))
@@ -83,6 +90,14 @@ class PtLibraryCheck(_PluginBase):
         except (TypeError, ValueError):
             self._cache_hours = 24
         self._episode_check = bool(config.get("episode_check", True))
+        for attr, key, default in (
+            ("_total_timeout", "total_timeout", 20),
+            ("_recognize_timeout", "recognize_timeout", 6),
+        ):
+            try:
+                setattr(self, attr, max(1, int(config.get(key) or default)))
+            except (TypeError, ValueError):
+                setattr(self, attr, default)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -132,6 +147,22 @@ class PtLibraryCheck(_PluginBase):
                             "type": "number",
                         },
                     },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "total_timeout",
+                            "label": "单次查询总超时（秒，建议 20；反代通常 30s 断流）",
+                            "type": "number",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "recognize_timeout",
+                            "label": "标题识别超时（秒，建议 6；超时自动跳过识别按片名搜）",
+                            "type": "number",
+                        },
+                    },
                 ],
             }
         ], {
@@ -139,6 +170,8 @@ class PtLibraryCheck(_PluginBase):
             "allow_anonymous": False,
             "episode_check": True,
             "cache_hours": 24,
+            "total_timeout": 20,
+            "recognize_timeout": 6,
         }
 
     # ------------------------------------------------------------------
@@ -168,11 +201,15 @@ class PtLibraryCheck(_PluginBase):
                     subtitle: str = "",
                     season: Optional[int] = None,
                     episode: Optional[int] = None,
-                    imdb: str = "") -> Dict[str, Any]:
+                    imdb: str = "",
+                    debug: int = 0) -> Dict[str, Any]:
         """查询入口。阻塞的媒体服务器调用放到线程池，避免卡住事件循环。
 
         imdb 优先：站点种子页已填 IMDb 时传进来，识别更快也更准；
         没有才用 title + subtitle 解析。
+
+        debug=1 时在返回体里附带解析结果、各阶段耗时与匹配置信度，便于排查
+        「为什么这个是未入库 / 为什么这么慢」，正常调用不带这个字段。
         """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
@@ -183,7 +220,8 @@ class PtLibraryCheck(_PluginBase):
         import asyncio
         try:
             data = await asyncio.to_thread(
-                self._query, title, (subtitle or "").strip(), season, episode, imdb
+                self._query, title, (subtitle or "").strip(), season, episode,
+                imdb, bool(debug),
             )
         except Exception as err:  # noqa: BLE001 - 接口不能把异常抛给前端
             return {"success": False, "message": f"查询失败：{err}"}
@@ -194,10 +232,10 @@ class PtLibraryCheck(_PluginBase):
     # ------------------------------------------------------------------
     def _query(self, title: str, subtitle: str,
                want_season: Optional[int], want_episode: Optional[int],
-               imdb: str = "") -> Dict[str, Any]:
-        # 缓存
+               imdb: str = "", debug: bool = False) -> Dict[str, Any]:
+        # 缓存（debug 请求一定要看真实耗时，不读缓存）
         cache_key = None
-        if self._cache_hours > 0:
+        if self._cache_hours > 0 and not debug:
             raw = f"{imdb}|{title}\n{subtitle}|{want_season}|{want_episode}"
             cache_key = _CACHE_PREFIX + str(abs(hash(raw)))
             hit = self.get_data(cache_key)
@@ -205,9 +243,11 @@ class PtLibraryCheck(_PluginBase):
                 if time.time() - hit["_t"] < self._cache_hours * 3600:
                     return hit["v"]
 
-        result = self._query_uncached(title, subtitle, want_season, want_episode, imdb)
+        result = self._query_uncached(title, subtitle, want_season, want_episode,
+                                      imdb, debug)
 
-        if cache_key:
+        # 超时的结果不写缓存，下次还会重试
+        if cache_key and not result.get("timeout"):
             try:
                 self.save_data(cache_key, {"_t": time.time(), "v": result})
             except Exception:  # noqa: BLE001 - 缓存失败不影响查询
@@ -216,7 +256,28 @@ class PtLibraryCheck(_PluginBase):
 
     def _query_uncached(self, title: str, subtitle: str,
                         want_season: Optional[int], want_episode: Optional[int],
-                        imdb: str = "") -> Dict[str, Any]:
+                        imdb: str = "", debug: bool = False) -> Dict[str, Any]:
+        """查询主流程。
+
+        设计原则（性能即功能）：反代 30s 断流，超时就是「没有状态」，
+        所以整个查询必须有时间预算，且**默认路径尽量不碰 TMDb**：
+
+          第一轮  只用本地 MetaInfo 解析出的片名去媒体服务器搜，
+                  命中「片名完全相同 / imdb 命中」就直接返回，零识别开销；
+          第二轮  只有第一轮没找准才做标题识别（硬超时，默认 6s），
+                  拿到 tmdb_id 与额外片名后重新评分；识别超时也照样返回结论。
+        """
+        t_start = time.time()
+        budget_total = self._budget("total_timeout", 20)
+        deadline = t_start + budget_total
+        dbg: Optional[Dict[str, Any]] = None
+        if debug:
+            dbg = {
+                "budget": {"total": budget_total,
+                           "recognize": self._budget("recognize_timeout", 6)},
+                "servers": [],
+            }
+
         # 1. 标题解析（MP 原生 MetaInfo 工厂，返回 MetaVideo/MetaAnime/MetaMusic）
         #    即便有 imdb 也要解析：季集号写在标题里，imdb 不带季集信息
         #    只给 imdb 不给标题时跳过解析
@@ -231,65 +292,217 @@ class PtLibraryCheck(_PluginBase):
         else:
             episode = getattr(meta, "begin_episode", None)
 
-        # 2. 识别：imdb 直查优先，拿不到才退回标题识别
-        tmdb_id = None
-        matched_by = None
-        mediainfo = self._recognize(meta, is_tv, imdb)
-        if mediainfo is not None:
-            matched_by = "imdb" if imdb else "title"
-            if getattr(mediainfo, "tmdb_id", None):
-                tmdb_id = str(mediainfo.tmdb_id)
-
         names = self._candidate_names(meta) if meta is not None else []
+        year = getattr(meta, "year", None)
+        if dbg is not None:
+            dbg["parse"] = {
+                "cost": round(time.time() - t_start, 2),
+                "is_tv": is_tv,
+                "season": season,
+                "episode": episode,
+                "year": year,
+                "names": names,
+                "name": getattr(meta, "name", None),
+                "cn_name": getattr(meta, "cn_name", None),
+                "en_name": getattr(meta, "en_name", None),
+            }
         if not names and not imdb:
-            return {"found": False, "reason": "无法解析片名", "title": title}
+            out = {"found": False, "reason": "无法解析片名", "title": title}
+            if dbg is not None:
+                dbg["elapsed"] = round(time.time() - t_start, 2)
+                out["debug"] = dbg
+            return out
 
-        # 3. 遍历 MP 里配置的所有媒体服务器
+        # 2. 遍历 MP 里配置的所有媒体服务器，先只搜不判断
         helper = MediaServerHelper()
         services = helper.get_services()
         if not services:
-            return {"found": False, "reason": "MP 未配置媒体服务器", "title": title}
+            out = {"found": False, "reason": "MP 未配置媒体服务器", "title": title}
+            if dbg is not None:
+                dbg["elapsed"] = round(time.time() - t_start, 2)
+                out["debug"] = dbg
+            return out
 
         errors: List[str] = []
-        year = getattr(meta, "year", None)
+        collected: List[Tuple[str, Any, str, List[dict]]] = []
         for name, svc in services.items():
+            if time.time() > deadline:
+                errors.append(f"{name}: 超出时间预算，跳过")
+                continue
             server = svc.instance
             # MediaServerConf.type 当前是 str；兼容未来改成 Enum 的情况
             raw_type = svc.type
             stype = str(getattr(raw_type, "value", raw_type) or "").lower()
-            if not server:
+            if not server or stype not in ("emby", "jellyfin", "plex"):
                 continue
+            t_srv = time.time()
             try:
-                if stype in ("emby", "jellyfin"):
-                    hit = self._check_emby(server, names, year, tmdb_id,
-                                           is_tv, season, episode, imdb)
-                elif stype == "plex":
-                    hit = self._check_plex(server, names, year, tmdb_id,
-                                           is_tv, season, episode, imdb)
+                if stype == "plex":
+                    items = self._search_plex(server, names, is_tv, imdb)
                 else:
-                    continue
+                    items = self._search_emby(server, names, is_tv, imdb)
             except Exception as err:  # noqa: BLE001 - 单个服务器失败不影响其他
                 errors.append(f"{name}: {err}")
                 continue
-            if hit:
-                hit["server"] = name
-                hit["server_type"] = stype
-                if imdb:
-                    hit["imdb"] = imdb
-                if matched_by:
-                    hit["matched_by"] = matched_by
-                return hit
+            cost_srv = time.time() - t_srv
+            collected.append((name, server, stype, items))
 
-        reason = "媒体库无此资源"
-        if not names:
-            # 只给 imdb 没给标题：Emby/Jellyfin 能直查，Plex 只能按片名搜
-            reason += "（只传 imdb 时 Plex 无法定位，请同时传 title）"
-        if errors:
-            reason += "（" + "；".join(errors[:2]) + "）"
-        out = {"found": False, "reason": reason, "title": title}
+            # 第一轮判定：只认「片名完全相同（100）」或「imdb 命中（400）」
+            best = self._pick_best_scored(items, names, year, None,
+                                         emby=(stype != "plex"), imdb=imdb)
+            if dbg is not None:
+                dbg["servers"].append({
+                    "name": name, "type": stype, "cost": round(cost_srv, 2),
+                    "candidates": len(items),
+                    "best": (best[0].get("Name") or best[0].get("title")) if best else None,
+                    "score": best[1] if best else 0,
+                })
+            if best and best[1] >= 100:
+                hit = self._hit_result(name, stype, server, best[0], is_tv,
+                                       season, episode, imdb, None)
+                if hit:
+                    return self._finish(hit, dbg, t_start)
+            # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
+
+        # 3. 第一轮没找准：做一次标题识别（硬超时）补 tmdb_id 与额外片名
+        tmdb_id = None
+        matched_by = None
+        extra_names: List[str] = []
+        if time.time() < deadline:
+            remain = deadline - time.time()
+            info, timed_out, cost = self._recognize_bounded(
+                meta, is_tv, imdb,
+                timeout=min(float(self._budget("recognize_timeout", 6)), remain),
+            )
+            if dbg is not None:
+                dbg["recognize"] = {
+                    "cost": round(cost, 2), "timed_out": timed_out, "ok": info is not None,
+                }
+            if info is not None:
+                matched_by = "imdb" if imdb else "title"
+                if getattr(info, "tmdb_id", None):
+                    tmdb_id = str(info.tmdb_id)
+                for value in (getattr(info, "title", None),
+                              getattr(info, "original_title", None)):
+                    value = str(value or "").strip()
+                    # 有些版本识别结果里 title 直接是 imdb id，别拿它当搜索词
+                    if not value or _IMDB_RE.search(value):
+                        continue
+                    if self._informative(value) and value not in names:
+                        extra_names.append(value)
+
+        # 3.1 识别给出了新的片名：补搜一次（只有这时才多打几个请求）
+        if extra_names:
+            if dbg is not None:
+                dbg["extra_names"] = extra_names
+            names = names + extra_names
+            for idx, (name, server, stype, items) in enumerate(list(collected)):
+                if time.time() > deadline:
+                    break
+                try:
+                    if stype == "plex":
+                        more = self._search_plex(server, extra_names, is_tv, imdb)
+                    else:
+                        more = self._search_emby(server, extra_names, is_tv, imdb)
+                except Exception as err:  # noqa: BLE001
+                    errors.append(f"{name}: {err}")
+                    continue
+                merged, seen = [], set()
+                for it in items + more:
+                    key = it.get("Id") or it.get("ratingKey") or id(it)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(it)
+                collected[idx] = (name, server, stype, merged)
+
+        # 4. 第二轮判定：带上 tmdb_id / 全部片名重新评分
+        for name, server, stype, items in collected:
+            best = self._pick_best_scored(items, names, year, tmdb_id,
+                                         emby=(stype != "plex"), imdb=imdb)
+            if not best:
+                continue
+            hit = self._hit_result(name, stype, server, best[0], is_tv,
+                                   season, episode, imdb, matched_by)
+            if hit:
+                return self._finish(hit, dbg, t_start)
+
+        if time.time() > deadline:
+            out = {"found": False, "timeout": True, "retryable": True,
+                   "reason": f"查询超时（{budget_total}s 预算用尽）", "title": title}
+        else:
+            reason = "媒体库无此资源"
+            if not names:
+                # 只给 imdb 没给标题：Emby/Jellyfin 能直查，Plex 只能按片名搜
+                reason += "（只传 imdb 时 Plex 无法定位，请同时传 title）"
+            if errors:
+                reason += "（" + "；".join(errors[:2]) + "）"
+            out = {"found": False, "reason": reason, "title": title}
         if imdb:
             out["imdb"] = imdb
+        return self._finish(out, dbg, t_start)
+
+    @staticmethod
+    def _finish(out: Dict[str, Any], dbg: Optional[Dict[str, Any]],
+                t_start: float) -> Dict[str, Any]:
+        if dbg is not None:
+            dbg["elapsed"] = round(time.time() - t_start, 2)
+            out["debug"] = dbg
         return out
+
+    def _hit_result(self, name: str, stype: str, server: Any, best: dict,
+                    is_tv: bool, season: Optional[int], episode: Optional[int],
+                    imdb: str, matched_by: Optional[str]) -> Optional[Dict[str, Any]]:
+        if stype == "plex":
+            hit = self._finish_plex(server, best, is_tv, season, episode)
+        else:
+            hit = self._finish_emby(server, best, is_tv, season, episode)
+        if not hit:
+            return None
+        hit["server"] = name
+        hit["server_type"] = stype
+        if imdb:
+            hit["imdb"] = imdb
+        # 命中依据：条目自身带的 imdb 与请求一致 → imdb；否则就是片名
+        if imdb and self._item_imdb(best, stype != "plex") == imdb:
+            hit["matched_by"] = "imdb"
+        elif matched_by:
+            hit["matched_by"] = matched_by
+        else:
+            hit["matched_by"] = "title"
+        return hit
+
+    def _budget(self, key: str, default: int) -> int:
+        """读时间预算配置，非法值回退默认。"""
+        try:
+            return max(1, int(getattr(self, "_" + key, default) or default))
+        except (TypeError, ValueError):
+            return default
+
+    def _recognize_bounded(self, meta: Any, is_tv: bool, imdb: str,
+                           timeout: float) -> Tuple[Any, bool, float]:
+        """带硬超时的识别。
+
+        识别（TMDb/TVDB）遇到综艺/直播/体育这类片名会一路重试到几十秒，
+        直接把整个请求拖过反代 30s 上限。放到后台线程里跑，到点就走人：
+        超时后线程自行结束（daemon），主流程照常用片名搜索兜底。
+        """
+        box: Dict[str, Any] = {}
+        t0 = time.time()
+
+        def _run() -> None:
+            try:
+                box["r"] = self._recognize(meta, is_tv, imdb)
+            except Exception as err:  # noqa: BLE001 - 识别失败不是致命错误
+                box["e"] = err
+
+        th = threading.Thread(target=_run, name="ptmc-recognize", daemon=True)
+        th.start()
+        th.join(max(0.5, float(timeout)))
+        timed_out = th.is_alive()
+        if timed_out:
+            self._log(f"标题识别超过 {timeout:.0f}s，跳过（按片名搜索兜底）")
+        return box.get("r"), timed_out, time.time() - t0
 
     # ------------------------------------------------------------------
     # 识别
@@ -369,6 +582,16 @@ class PtLibraryCheck(_PluginBase):
                     tmdb_id: Optional[str], is_tv: bool,
                     season: Optional[int], episode: Optional[int],
                     imdb: str = "") -> Optional[Dict[str, Any]]:
+        """搜索结果 + 选优 + 组装（保留给按服务器整体查询的场景）。"""
+        items = self._search_emby(server, names, is_tv, imdb)
+        best = self._pick_best(items, names, year, tmdb_id, emby=True, imdb=imdb)
+        if not best:
+            return None
+        return self._finish_emby(server, best, is_tv, season, episode)
+
+    def _search_emby(self, server: Any, names: List[str], is_tv: bool,
+                     imdb: str = "") -> List[dict]:
+        """只做搜索，把候选条目全部返回（选优交给 _pick_best_scored）。"""
         item_type = "Series" if is_tv else "Movie"
         fields = ("Fields=MediaSources,MediaStreams,ProviderIds,ProductionYear,"
                   "OriginalTitle,Path")
@@ -428,11 +651,10 @@ class PtLibraryCheck(_PluginBase):
                         items.append(it)
                 if items:
                     break
+        return items
 
-        best = self._pick_best(items, names, year, tmdb_id, emby=True, imdb=imdb)
-        if not best:
-            return None
-
+    def _finish_emby(self, server: Any, best: dict, is_tv: bool,
+                     season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
         out: Dict[str, Any] = {
             "found": True,
             "type": "tv" if is_tv else "movie",
@@ -516,6 +738,15 @@ class PtLibraryCheck(_PluginBase):
                     tmdb_id: Optional[str], is_tv: bool,
                     season: Optional[int], episode: Optional[int],
                     imdb: str = "") -> Optional[Dict[str, Any]]:
+        candidates = self._search_plex(server, names, is_tv)
+        best = self._pick_best(candidates, names, year, tmdb_id, emby=False, imdb=imdb)
+        if not best:
+            return None
+        return self._finish_plex(server, best, is_tv, season, episode)
+
+    def _search_plex(self, server: Any, names: List[str], is_tv: bool,
+                     imdb: str = "") -> List[dict]:
+        """Plex 只能按片名搜，imdb 用于在 _pick_best_scored 里加权。"""
         mtype = 2 if is_tv else 1
         candidates: List[dict] = []
         seen = set()
@@ -538,11 +769,10 @@ class PtLibraryCheck(_PluginBase):
                         candidates.append(md)
             if candidates:
                 break
+        return candidates
 
-        best = self._pick_best(candidates, names, year, tmdb_id, emby=False, imdb=imdb)
-        if not best:
-            return None
-
+    def _finish_plex(self, server: Any, best: dict, is_tv: bool,
+                     season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
         rk = best.get("ratingKey")
         out: Dict[str, Any] = {
             "found": True,
@@ -690,6 +920,34 @@ class PtLibraryCheck(_PluginBase):
     # 匹配
     # ------------------------------------------------------------------
     @staticmethod
+    def _informative(name: str) -> bool:
+        """这个名字能不能用来定位一条媒体。
+
+        MP 的 MetaInfo 会把一些直播/体育标题解析成 "The"、"2026" 这种碎片，
+        拿它去做包含匹配会命中一堆无关条目（实测把 CCTV5 开幕式判定成
+        《The Adventurers》），所以短到没有信息量的名字一律不参与匹配。
+        """
+        core = re.sub(r"[\s\W_]+", "", (name or "").strip())
+        if len(core) < 2:
+            return False
+        if core.isdigit():
+            return False
+        if re.fullmatch(r"[A-Za-z]{1,3}", core):
+            return False
+        return True
+
+    @staticmethod
+    def _containment_ok(c: str, w: str) -> bool:
+        """包含匹配的额外门槛：短的那侧必须有信息量，且不能短得离谱。"""
+        short, long_ = (c, w) if len(c) <= len(w) else (w, c)
+        if not PtLibraryCheck._informative(short):
+            return False
+        if re.search(r"[\u3400-\u9fff]", short):
+            # 中文片名本来就短（4 个字很常见），包含即算命中
+            return True
+        return len(short) / max(1, len(long_)) >= 0.5
+
+    @staticmethod
     def _candidate_names(meta: Any) -> List[str]:
         """按优先级给出可用于搜索与比对的名称列表。"""
         names: List[str] = []
@@ -706,7 +964,11 @@ class PtLibraryCheck(_PluginBase):
                 continue
             # 去掉季集后缀，避免搜索词带季号
             value = re.sub(r"[第S]\s*\d+\s*[季部]?", "", value).strip()
-            if value and value not in names:
+            if len(value) < 2:
+                continue
+            if not PtLibraryCheck._informative(value):
+                continue
+            if value not in names:
                 names.append(value)
         return names
 
@@ -722,7 +984,7 @@ class PtLibraryCheck(_PluginBase):
                 continue
             if c == w:
                 return 100
-            if w in c or c in w:
+            if (w in c or c in w) and PtLibraryCheck._containment_ok(c, w):
                 best = max(best, 80)
                 continue
             strip = lambda s: re.sub(r"[第S]\s*\d+[季部]?", "", s).replace(" ", "")  # noqa: E731
@@ -752,6 +1014,18 @@ class PtLibraryCheck(_PluginBase):
     def _pick_best(self, items: List[dict], names: List[str], year: Optional[str],
                    tmdb_id: Optional[str], emby: bool,
                    imdb: str = "") -> Optional[dict]:
+        scored = self._pick_best_scored(items, names, year, tmdb_id, emby, imdb)
+        return scored[0] if scored else None
+
+    def _pick_best_scored(self, items: List[dict], names: List[str], year: Optional[str],
+                          tmdb_id: Optional[str], emby: bool,
+                          imdb: str = "") -> Optional[Tuple[dict, int]]:
+        """返回 (条目, 分数)。
+
+        分数语义：100 = 片名完全相同；>=400 = imdb 身份命中（片名可以不像）；
+        80/70 = 包含/去季号后相同（模糊，需要 tmdb_id 再确认）；
+        <=0 视为不相关。
+        """
         if not items:
             return None
         scored = []
@@ -781,7 +1055,7 @@ class PtLibraryCheck(_PluginBase):
         if not scored:
             return None
         scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
+        return scored[0][1], scored[0][0]
 
     # ------------------------------------------------------------------
     # 工具

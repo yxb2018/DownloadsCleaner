@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.1.1
-// @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页只在已入库时标「库内」，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
+// @version      2.1.2
+// @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       YaoXiaoBin
 // @match        *://*.ourbits.club/*
 // @match        *://*.pterclub.com/*
@@ -38,13 +38,17 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.1.1）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.1.2）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.1.2
+ *   · 列表页恢复「双向」状态：已入库标绿色「库内」，未入库标灰色「未入库」
+ *     （缺集仍是「库内·缺 SxxExx」）。查询中/查询失败仍不占位，避免闪烁与误导。
  *
  * v2.1.1
  *   · 安全整改：脚本里不再内置任何 MP 域名与 API Key。地址/密钥改由油猴菜单
@@ -107,6 +111,8 @@
       cacheHours: 24,        // 查询缓存时长
       minIntervalMs: 250,    // 请求最小间隔（只打自己的 MP，无站点风控压力）
       concurrency: 2,        // 并发数
+      retries: 2,            // 网络错误/超时/5xx 的重试次数（0 = 不重试）
+      retryDelayMs: 400,     // 首次重试等待，之后按次数线性递增
       badgeCompact: true,    // 列表页用紧凑徽标
     },
   };
@@ -204,29 +210,14 @@
    * 三、MP 插件接口
    * ===================================================================== */
 
-  /**
-   * 调 PtLibraryCheck 插件。
-   * @param {string} rawTitle 标题行 + 换行 + 副标题
-   * @param {string} [imdb]  站点已填的 IMDb ID（tt1234567），有就走 IMDb 直查
-   * @returns {Promise<{found, type, title, year, quality, seasons, episode, server, reason}>}
-   */
-  function checkLibrary(rawTitle, imdb) {
-    return queue.push(() => new Promise((resolve, reject) => {
-      const host = mpHost();
-      if (!host) {
-        reject(new Error('未设置 MoviePilot 地址：油猴菜单 → ① 设置 MP 地址与 API Key'));
-        return;
-      }
-      const nl = rawTitle.indexOf('\n');
-      const title = (nl >= 0 ? rawTitle.slice(0, nl) : rawTitle).trim();
-      const subtitle = nl >= 0 ? rawTitle.slice(nl + 1).trim() : '';
-      const url = `${host}${CONFIG.apiPath}`
-        + `?title=${encodeURIComponent(title)}`
-        + (subtitle ? `&subtitle=${encodeURIComponent(subtitle)}` : '')
-        + (imdb ? `&imdb=${encodeURIComponent(imdb)}` : '');
-      const headers = { Accept: 'application/json' };
-      const key = mpKey();
-      if (key) headers['X-API-KEY'] = key;
+  /** 单次请求：只发一次，失败时给 Error 打上 retryable 标记（4xx/业务失败不重试） */
+  function mpRequest(url, headers) {
+    return new Promise((resolve, reject) => {
+      const retryable = (msg) => {
+        const e = new Error(msg);
+        e.retryable = true;
+        return e;
+      };
       GM_xmlhttpRequest({
         method: 'GET',
         url,
@@ -238,7 +229,9 @@
             return;
           }
           if (res.status < 200 || res.status >= 300) {
-            reject(new Error(`HTTP ${res.status} ${url.slice(0, 80)}`));
+            const e = new Error(`HTTP ${res.status} ${url.slice(0, 80)}`);
+            e.retryable = res.status >= 500;   // 5xx 是服务端抖动，值得重试
+            reject(e);
             return;
           }
           let d;
@@ -246,10 +239,53 @@
           if (d && d.success === false) { reject(new Error(d.message || '插件返回失败')); return; }
           resolve(d && d.data ? d.data : d);
         },
-        onerror: () => reject(new Error('network error ' + url.slice(0, 80))),
-        ontimeout: () => reject(new Error('timeout ' + url.slice(0, 80))),
+        onerror: () => reject(retryable('network error ' + url.slice(0, 80))),
+        ontimeout: () => reject(retryable('timeout ' + url.slice(0, 80))),
       });
-    }));
+    });
+  }
+
+  /**
+   * 调 PtLibraryCheck 插件。
+   * 100 条列表并发查询时，反代偶发掐连接（network error），单次失败不代表没入库，
+   * 所以网络错误 / 超时 / 5xx 会自动重试 2 次（共 3 次），4xx 与业务失败不重试。
+   * @param {string} rawTitle 标题行 + 换行 + 副标题
+   * @param {string} [imdb]  站点已填的 IMDb ID（tt1234567），有就走 IMDb 直查
+   * @returns {Promise<{found, type, title, year, quality, seasons, episode, server, reason}>}
+   */
+  function checkLibrary(rawTitle, imdb) {
+    return queue.push(async () => {
+      const host = mpHost();
+      if (!host) {
+        throw new Error('未设置 MoviePilot 地址：油猴菜单 → ① 设置 MP 地址与 API Key');
+      }
+      const nl = rawTitle.indexOf('\n');
+      const title = (nl >= 0 ? rawTitle.slice(0, nl) : rawTitle).trim();
+      const subtitle = nl >= 0 ? rawTitle.slice(nl + 1).trim() : '';
+      const url = `${host}${CONFIG.apiPath}`
+        + `?title=${encodeURIComponent(title)}`
+        + (subtitle ? `&subtitle=${encodeURIComponent(subtitle)}` : '')
+        + (imdb ? `&imdb=${encodeURIComponent(imdb)}` : '');
+      const headers = { Accept: 'application/json' };
+      const key = mpKey();
+      if (key) headers['X-API-KEY'] = key;
+
+      let lastErr = null;
+      const tries = 1 + Math.max(0, Math.floor(CONFIG.behavior.retries || 0));
+      const delay = Math.max(0, CONFIG.behavior.retryDelayMs || 0);
+      for (let attempt = 0; attempt < tries; attempt++) {
+        try {
+          return await mpRequest(url, headers);
+        } catch (e) {
+          lastErr = e;
+          if (e.retryable !== true) break;
+          if (attempt < tries - 1 && delay) {
+            await new Promise((r) => setTimeout(r, delay * (attempt + 1)));
+          }
+        }
+      }
+      throw lastErr || new Error('查询失败');
+    });
   }
 
   const checkCache = new Map();
@@ -449,21 +485,40 @@
     return parts.join('');
   }
 
-  /** 列表页紧凑徽标
-   *  只在「已入库」时渲染。未入库 / 查询中 / 查询失败一律返回空串 ——
-   *  列表页不做提示性占位，避免满屏「未入库」「查询失败」把站点原生列表刷花。
+  /** 列表页紧凑徽标 —— 每一行都必须有且只有一个状态，四选一：
+   *    · 查询中…        灰色蓝字（还没结果，先占位，避免行内空白）
+   *    · 库内           绿色
+   *    · 库内·缺 SxxExx 橙色（剧集在库但缺这一集）
+   *    · 未入库         灰色
+   *  查询失败单独给红字「查询失败」（不是"未入库"，不能把错误当结论）。
    *  分辨率、DoVi、音轨等详细信息只在详情页面板里给（panelHtml）。
    */
+  function listPendingHtml() {
+    return '<span class="ptmc-badge load" title="正在查询 MoviePilot">查询中…</span>';
+  }
+
+  function listFailHtml(msg) {
+    return `<span class="ptmc-badge err" title="${esc(msg || '查询失败')}">查询失败</span>`;
+  }
+
   function badgeHtml(r) {
-    if (!r || r.error || !r.found) return '';
-    const ep = r.episode;
-    if (ep && ep.found === false) {
-      const s = String(ep.season).padStart(2, '0');
-      const e = String(ep.episode).padStart(2, '0');
-      return `<span class="ptmc-badge part" title="${esc(r.reason || '剧集在库，但缺这一集')}">库内·缺 S${s}E${e}</span>`;
+    if (r && r.error) return listFailHtml(r.error);
+    if (!r) return listPendingHtml();
+    if (r.found) {
+      const ep = r.episode;
+      if (ep && ep.found === false) {
+        const s = String(ep.season).padStart(2, '0');
+        const e = String(ep.episode).padStart(2, '0');
+        return `<span class="ptmc-badge part" title="${esc(r.reason || '剧集在库，但缺这一集')}">库内·缺 S${s}E${e}</span>`;
+      }
+      const src = r.quality && r.quality.src_name;
+      return `<span class="ptmc-badge in" title="${esc(r.reason || src || '已在媒体库')}">库内</span>`;
     }
-    const src = r.quality && r.quality.src_name;
-    return `<span class="ptmc-badge in" title="${esc(r.reason || src || '已在媒体库')}">库内</span>`;
+    const tip = [
+      r.title ? `识别为：${r.title}${r.year ? ' (' + r.year + ')' : ''}` : '',
+      r.reason || '媒体库中未找到该资源',
+    ].filter(Boolean).join('｜');
+    return `<span class="ptmc-badge out" title="${esc(tip)}">未入库</span>`;
   }
 
   /** 详情页面板 */
@@ -522,16 +577,20 @@
     for (const it of items) {
       if (processed.has(it.link)) continue;
       processed.add(it.link);
+      // 先占位「查询中…」：每一行都必须有状态，不能等结果才出现
+      const holder = document.createElement('span');
+      holder.className = 'ptmc-holder';
+      holder.innerHTML = listPendingHtml();
+      it.link.insertAdjacentElement('afterend', holder);
       // 标题行 + 副标题合并送检：片名取标题行，分辨率/季集等质量标签全文匹配
       const raw = it.subtitle ? `${it.title}\n${it.subtitle}` : it.title;
       const r = await checkTorrentCached(raw, it.imdb);
-      if (r && r.error) { warnOnce(r.error); continue; }
-      const html = badgeHtml(r);
-      if (!html) continue;   // 未入库：不留任何痕迹
-      const holder = document.createElement('span');
-      holder.className = 'ptmc-holder';
-      it.link.insertAdjacentElement('afterend', holder);
-      holder.innerHTML = html;
+      if (r && r.error) {
+        warnOnce(r.error);
+        holder.innerHTML = listFailHtml(r.error);
+        continue;
+      }
+      holder.innerHTML = badgeHtml(r);
     }
   }
 
@@ -628,7 +687,8 @@
   // 供 Node 单测导出
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-      CONFIG, BUILTIN_SITES, hash, badgeHtml, panelHtml, tagsHtml,
+      CONFIG, BUILTIN_SITES, hash, badgeHtml, listPendingHtml, listFailHtml,
+      panelHtml, tagsHtml,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, mpKey, renderList, renderDetail,
