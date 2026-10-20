@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.14"
+    plugin_version = "1.1.15"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -961,11 +961,14 @@ class PtLibraryCheck(_PluginBase):
         sid = ""
         inst = getattr(svc, "instance", None)
         if inst is not None:
-            for path in ("/System/Info/Public", "/emby/System/Info/Public"):
+            # 注意：Emby 的 get_data 只做占位符替换、不自动拼 host（Plex 的才会），
+            # 所以这里必须给完整 URL；System/Info/Public 是匿名端点，token 可省但带上无害
+            import json as _json
+            for path in ("[HOST]/emby/System/Info/Public?X-Emby-Token=[APIKEY]",
+                         "[HOST]/System/Info/Public?X-Emby-Token=[APIKEY]"):
                 try:
                     res = inst.get_data(path)
                     txt = res.text if hasattr(res, "text") else str(res or "")
-                    import json as _json
                     data = _json.loads(txt)
                     sid = str(data.get("Id") or data.get("serverId") or "")
                 except Exception:  # noqa: BLE001
