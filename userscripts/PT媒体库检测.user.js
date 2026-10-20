@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.1.3
+// @version      2.1.4
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       YaoXiaoBin
 // @match        *://*.ourbits.club/*
@@ -163,6 +163,18 @@
   function cacheSet(key, val) {
     try { GM_setValue('q_' + key, JSON.stringify({ t: Date.now(), v: val })); } catch (e) {}
   }
+  /** 客户端缓存的「口径版本」。
+   *  插件侧的判定逻辑一改（比如收紧「库内」门槛），这里的缓存就必须失效，
+   *  否则页面会一直显示上一版的结论 —— 实测 1.1.7 改完后页面还是旧数字。
+   *  默认跟随脚本 @version：每次发版自动作废旧缓存。 */
+  const SCRIPT_VER = (() => {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) {
+        return String(GM_info.script.version);
+      }
+    } catch (e) {}
+    return '2.1.4';
+  })();
 
   // 限流队列：全局串行 + 最小间隔
   const queue = {
@@ -293,9 +305,12 @@
     // 有 IMDb 时以 IMDb 为主键：同一部片子不同压制版本可共用一次查询结果
     const key = `mp|${imdb || ''}|${rawTitle}`;
     if (checkCache.has(key)) return checkCache.get(key);
-    const hit = cacheGet('chk_' + hash(key), CONFIG.behavior.cacheHours * 3600e3);
+    const hit = cacheGet('chk_' + hash(SCRIPT_VER + '|' + key), CONFIG.behavior.cacheHours * 3600e3);
     if (hit) { checkCache.set(key, hit); return hit; }
-    const p = checkLibrary(rawTitle, imdb).then((r) => { cacheSet('chk_' + hash(key), r); return r; })
+    const p = checkLibrary(rawTitle, imdb).then((r) => {
+      cacheSet('chk_' + hash(SCRIPT_VER + '|' + key), r);
+      return r;
+    })
       .catch((e) => ({ found: false, error: e.message }));
     checkCache.set(key, p);
     return p;
