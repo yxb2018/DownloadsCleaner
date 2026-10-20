@@ -6,7 +6,7 @@ MP 配置的媒体服务器（Emby / Plex / Jellyfin ...）中，以及在库版
 
 设计要点：
 - 插件复用 MP 已配置的媒体服务器凭据，**不在任何地方保存 Emby/Plex 密钥**；
-- 标题识别直接用 MP 的 MetaInfo + MediaChain.recognize_by_meta，
+- 标题识别直接用 MP 的 MetaBase + MediaChain.recognize_by_meta，
   与订阅 / 媒体整理用的是同一套解析与 TMDB 识别；
 - 画质信息通过媒体服务器模块自带的 get_data() 取原始 JSON 解析，
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from app.application.mediaserver import MediaServerHelper
 from app.chain.media import MediaChain
-from app.domain.metainfo import MetaInfo
+from app.domain.meta.metabase import MetaBase
 from app.schemas.types import MediaType
 from app.sdk.plugin import _PluginBase
 
@@ -190,8 +190,8 @@ class PtLibraryCheck(_PluginBase):
 
     def _query_uncached(self, title: str, subtitle: str,
                         want_season: Optional[int], want_episode: Optional[int]) -> Dict[str, Any]:
-        # 1. 标题解析（MP 原生 MetaInfo）
-        meta = MetaInfo(title, subtitle or None)
+        # 1. 标题解析（MP 原生 MetaBase，v3.1.4 起替代旧 MetaInfo）
+        meta = MetaBase(title, subtitle or None)
         is_tv = meta.type == MediaType.TV or bool(meta.begin_season)
         season = want_season if want_season is not None else meta.begin_season
         episode = want_episode if want_episode is not None else meta.begin_episode
@@ -218,7 +218,9 @@ class PtLibraryCheck(_PluginBase):
         errors: List[str] = []
         for name, svc in services.items():
             server = svc.instance
-            stype = (svc.type or "").lower()
+            # MediaServerConf.type 当前是 str；兼容未来改成 Enum 的情况
+            raw_type = svc.type
+            stype = str(getattr(raw_type, "value", raw_type) or "").lower()
             if not server:
                 continue
             try:
