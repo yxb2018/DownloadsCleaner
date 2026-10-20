@@ -312,6 +312,8 @@ class PtLibraryCheck(_PluginBase):
         # 剧集：列出在库季集
         seasons = self._emby_seasons(server, best.get("Id"))
         out["seasons"] = {str(k): v for k, v in list(seasons.items())[:_MAX_SEASONS]}
+        if season is not None:
+            out["episode_count"] = len(seasons.get(season) or [])
         if season is not None and episode is not None and self._episode_check:
             eps = seasons.get(season) or []
             if episode in eps:
@@ -423,6 +425,7 @@ class PtLibraryCheck(_PluginBase):
         if season is not None and self._episode_check:
             eps = self._plex_season_episodes(server, rk, season)
             out["seasons"] = {str(season): eps[:_MAX_SEASONS]} if eps else {}
+            out["episode_count"] = len(eps)
             if episode is not None:
                 if episode in eps:
                     out["episode"] = {"season": season, "episode": episode, "found": True}
