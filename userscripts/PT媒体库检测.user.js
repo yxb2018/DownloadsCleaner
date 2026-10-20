@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.1.2
+// @version      2.1.3
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       YaoXiaoBin
 // @match        *://*.ourbits.club/*
@@ -416,7 +416,11 @@
       const cell = a.closest('td') || a.parentElement;
       if (cell) {
         const clone = cell.cloneNode(true);
-        clone.querySelectorAll('a, script, style, .ptmc-badge, .ptmc-holder').forEach((n) => n.remove());
+        // .optiontag 是站点自己的标签（Dolby Vision/国语/中字/HDR10），
+        // 留在副标题里会跟中文片名粘成一片（「中字HDR10倩女幽魂2：人间道」），
+        // 干扰插件侧从副标题里抽中文片名
+        clone.querySelectorAll('a, script, style, .ptmc-badge, .ptmc-holder, .optiontag, img')
+          .forEach((n) => n.remove());
         subtitle = clone.textContent.replace(/\s+/g, ' ').trim().slice(0, 300);
       }
       out.push({ id, row, link: a, title, subtitle, imdb: imdbOfRow(row) });
@@ -514,8 +518,13 @@
       const src = r.quality && r.quality.src_name;
       return `<span class="ptmc-badge in" title="${esc(r.reason || src || '已在媒体库')}">库内</span>`;
     }
+    // tooltip 只展示 MP 自己解析出来的片名 —— 排查「库里有却判未入库」时，
+    // 需要看到 MP 到底把这条发布名认成了什么；解析不出来就如实说，不拿发布名充数
+    const name = r.display || '';
+    const recog = r.recognized && r.recognized.title;
     const tip = [
-      r.title ? `识别为：${r.title}${r.year ? ' (' + r.year + ')' : ''}` : '',
+      name ? `MP 识别：${name}${r.year ? ' (' + r.year + ')' : ''}` : 'MP 未能解析出片名',
+      recog && recog !== name ? `识别补充：${recog}` : '',
       r.reason || '媒体库中未找到该资源',
     ].filter(Boolean).join('｜');
     return `<span class="ptmc-badge out" title="${esc(tip)}">未入库</span>`;
@@ -527,8 +536,21 @@
     if (!r) return `<div class="ptmc-panel"><div class="t">媒体库查询中…</div></div>`;
     const head = (rawTitle || '').split('\n')[0];
     if (!r.found) {
+      // MP 解析结果如实展示（诊断用）；解析不出来就说解析不出来，不用发布名顶替
+      const parsed = r.display
+        ? `${esc(r.display)}${r.year ? ' (' + esc(r.year) + ')' : ''}`
+          + `<span style="color:#9aa0a6">（${esc(r.display_src || 'parsed')}）</span>`
+        : '<span style="color:#c0392b">未能解析出片名</span>';
+      const rows2 = [
+        ['MP 识别', parsed],
+      ];
+      if (r.recognized && r.recognized.title) {
+        rows2.push(['识别补充', `${esc(r.recognized.title)}${r.recognized.original_title && r.recognized.original_title !== r.recognized.title ? ' / ' + esc(r.recognized.original_title) : ''}${r.recognized.tmdb_id ? ` <span style="color:#9aa0a6">TMDB ${esc(r.recognized.tmdb_id)}</span>` : ''}`]);
+      }
+      rows2.push(['未匹配原因', esc(r.reason || '无匹配')]);
       return `<div class="ptmc-panel"><div class="t out">✗ 媒体库中未找到该资源</div>
-        <div style="color:#6b7280">识别：${esc(r.title || head)}${r.year ? ' (' + esc(r.year) + ')' : ''}｜原因：${esc(r.reason || '无匹配')}</div></div>`;
+        <table>${rows2.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table>
+        <div style="color:#9aa0a6;font-size:12px;margin-top:4px">发布名：${esc(head)}</div></div>`;
     }
     const q = r.quality || {};
     const rows = [];

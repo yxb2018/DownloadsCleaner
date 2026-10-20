@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.4",
+    "version": "1.1.5",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.5": "修「库里明明有却判未入库」（实测《倩女幽魂2：人间道》：主标题是英文原名 A Chinese Ghost Story II，中文名只在副标题里，MP 的 MetaInfo 会丢掉中文副标题，按英文名去 Plex 搜直接 0 候选）。现在从副标题里抽中文片名参与搜索与比对——不依赖 MetaInfo，先剔掉方括号发布说明与国语/中字/简繁等标签、排除纯季集号。另外返回值新增 display / display_src / recognized：徽标 tooltip 改为显示 MP 实际解析出的片名（之前显示的是整条发布名，看不出是解析错了还是比对错了），解析不出来就如实提示「未能解析出片名」，识别补充的片名与 TMDB ID 一并给出。",
       "v1.1.4": "按官方《MoviePilot 插件开发指南（V3）》做规范适配：宿主导入迁移到稳定 SDK（app.sdk.media / app.sdk.services / app.sdk.logging，保留旧路径兜底），补充插件图标与 author_url、显式空实现 get_command；本插件索引声明 release=false（直接从仓库文件分发，不走 GitHub Release 压缩包）。",
       "v1.1.3": "修 Plex/Emby 双语名漏判：Plex 搜索结果的 title 是显示名（可能是中文译名），原名在 originalTitle/titleSort 里，之前只比 title，导致明明在库的电影被判未入库（实测《盗梦空间》带 imdb 仍返回未入库）。现在候选条目的多个名字都参与比对；同时把 MP 解析出的 name 加入搜索词，不再拿整条发布名去搜。",
       "v1.1.2": "查询加了时间预算，解决反代 30s 断流导致的「查询失败」：先只用本地解析的片名搜媒体服务器（命中片名完全相同/imdb 即返回，不碰 TMDb），没找准才做标题识别且硬超时 6s，超时照样给结论；总预算 20s，超时返回 retryable 而不写缓存。同时修掉碎片名误判——MP 把直播/体育标题解析成 \"The\" 这类碎片时会包含匹配到无关条目（实测把 CCTV5 开幕式误标成库内《The Adventurers》），现在短于信息量的名字不参与匹配。新增 total_timeout / recognize_timeout 配置与 debug=1 诊断参数。",

@@ -50,6 +50,15 @@ _MAX_SEASONS = 20
 # IMDb ID：tt + 6~10 位数字
 _IMDB_RE = re.compile(r"(tt\d{6,10})", re.I)
 
+# 副标题里常见的发布标签词，抽中文片名时先剔掉它们
+_CN_TAG_WORDS = (
+    "中文字幕", "国语中字", "国语", "粤语", "英语", "日语", "韩语", "国配", "双语",
+    "多语", "中字", "简繁", "简体", "繁体", "简中", "繁中", "字幕", "特效",
+    "原盘", "DIY", "Remux", "重制", "修复", "加长版", "导演剪辑", "完整版",
+    "未删减", "免费", "优惠", "剩余时间", "剩余", "限时", "置顶", "候选",
+    "高清", "蓝光", "超清", "完结", "全集", "更新",
+)
+
 
 def _normalize_imdb(value: Any) -> str:
     """把站点上各种写法（完整 URL / 带空格 / 纯 tt1234567）统一成 tt1234567。"""
@@ -66,7 +75,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -313,6 +322,15 @@ class PtLibraryCheck(_PluginBase):
 
         names = self._candidate_names(meta) if meta is not None else []
         year = getattr(meta, "year", None)
+        # 副标题里的中文名：PT 站常见「主标题=英文原名，中文片名只在副标题里」，
+        # 而媒体库里的条目往往以中文命名 —— 只用英文名搜会 0 候选。
+        # 注意：它只进搜索候选，**不参与 tooltip 的「识别为」**（那必须如实反映 MP 的解析结果）
+        sub_names = self._subtitle_names(subtitle)
+        if sub_names:
+            names = [n for n in sub_names if n not in names] + names
+        # MP 自己解析出来的片名（诊断用：徽标 tooltip 显示它，绝不拿发布名充数）
+        label, label_src = self._display_label(meta)
+        state: Dict[str, Any] = {"label": label, "src": label_src, "recognized": None}
         if dbg is not None:
             dbg["parse"] = {
                 "cost": round(time.time() - t_start, 2),
@@ -321,26 +339,31 @@ class PtLibraryCheck(_PluginBase):
                 "episode": episode,
                 "year": year,
                 "names": names,
+                "sub_names": sub_names,
+                "display": label,
                 "name": getattr(meta, "name", None),
                 "cn_name": getattr(meta, "cn_name", None),
                 "en_name": getattr(meta, "en_name", None),
             }
-        if not names and not imdb:
-            out = {"found": False, "reason": "无法解析片名", "title": title}
+
+        def _done(payload: Dict[str, Any]) -> Dict[str, Any]:
+            """统一出口：补上 MP 的解析结果（徽标 tooltip 用），不用发布名。"""
+            payload.setdefault("display", state["label"])
+            payload.setdefault("display_src", state["src"])
+            if state["recognized"]:
+                payload.setdefault("recognized", state["recognized"])
             if dbg is not None:
-                dbg["elapsed"] = round(time.time() - t_start, 2)
-                out["debug"] = dbg
-            return out
+                dbg["parse"]["display"] = state["label"]
+            return self._finish(payload, dbg, t_start)
+
+        if not names and not imdb:
+            return _done({"found": False, "reason": "无法解析片名", "title": title})
 
         # 2. 遍历 MP 里配置的所有媒体服务器，先只搜不判断
         helper = MediaServerHelper()
         services = helper.get_services()
         if not services:
-            out = {"found": False, "reason": "MP 未配置媒体服务器", "title": title}
-            if dbg is not None:
-                dbg["elapsed"] = round(time.time() - t_start, 2)
-                out["debug"] = dbg
-            return out
+            return _done({"found": False, "reason": "MP 未配置媒体服务器", "title": title})
 
         errors: List[str] = []
         collected: List[Tuple[str, Any, str, List[dict]]] = []
@@ -380,7 +403,7 @@ class PtLibraryCheck(_PluginBase):
                 hit = self._hit_result(name, stype, server, best[0], is_tv,
                                        season, episode, imdb, None)
                 if hit:
-                    return self._finish(hit, dbg, t_start)
+                    return _done(hit)
             # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
 
         # 3. 第一轮没找准：做一次标题识别（硬超时）补 tmdb_id 与额外片名
@@ -401,6 +424,19 @@ class PtLibraryCheck(_PluginBase):
                 matched_by = "imdb" if imdb else "title"
                 if getattr(info, "tmdb_id", None):
                     tmdb_id = str(info.tmdb_id)
+                recog: Dict[str, Any] = {}
+                for key, attr in (("title", "title"), ("original_title", "original_title")):
+                    value = str(getattr(info, attr, None) or "").strip()
+                    if value and not _IMDB_RE.search(value):
+                        recog[key] = value
+                if tmdb_id:
+                    recog["tmdb_id"] = tmdb_id
+                if recog:
+                    state["recognized"] = recog
+                    # MP 连片名都解析不出来时，用识别结果兜底显示（source 标记为 recognize）
+                    if not state["label"]:
+                        state["label"] = recog.get("title") or recog.get("original_title") or ""
+                        state["src"] = "recognize"
                 for value in (getattr(info, "title", None),
                               getattr(info, "original_title", None)):
                     value = str(value or "").strip()
@@ -449,7 +485,7 @@ class PtLibraryCheck(_PluginBase):
             hit = self._hit_result(name, stype, server, best[0], is_tv,
                                    season, episode, imdb, matched_by)
             if hit:
-                return self._finish(hit, dbg, t_start)
+                return _done(hit)
 
         if time.time() > deadline:
             out = {"found": False, "timeout": True, "retryable": True,
@@ -464,7 +500,7 @@ class PtLibraryCheck(_PluginBase):
             out = {"found": False, "reason": reason, "title": title}
         if imdb:
             out["imdb"] = imdb
-        return self._finish(out, dbg, t_start)
+        return _done(out)
 
     @staticmethod
     def _finish(out: Dict[str, Any], dbg: Optional[Dict[str, Any]],
@@ -996,6 +1032,59 @@ class PtLibraryCheck(_PluginBase):
             if value not in names:
                 names.append(value)
         return names
+
+    @classmethod
+    def _subtitle_names(cls, subtitle: str) -> List[str]:
+        """从副标题里抽取中文片名。
+
+        PT 站点的发布名经常是「英文原名 + 副标题中文名」：主标题
+        `A Chinese Ghost Story II 1990 UHD BluRay …`，中文名
+        `倩女幽魂2：人间道` 只出现在同行的副标题里。MP 的 MetaInfo 在这种
+        组合下会把中文副标题当噪声丢掉（cn_name 为空），于是按英文名去
+        Plex 搜 —— 而库里条目叫「倩女幽魂2：人间道」，直接 0 候选。
+
+        这里不依赖 MetaInfo：先砍掉方/圆括号里的发布说明，再取连续中文片段，
+        剔除纯标签（国语/中字/简繁…）与纯季集号，剩下的当作候选片名。
+        """
+        text = str(subtitle or "")
+        if not text:
+            return []
+        text = re.sub(r"\[[^\]]*\]|【[^】]*】|\([^)]*\)|（[^）]*）", " ", text)
+        names: List[str] = []
+        for seg in re.findall(r"[\u3400-\u9fff][\u3400-\u9fff0-9０-９：:·・]*", text):
+            core = seg.strip(" ：:·・")
+            for word in _CN_TAG_WORDS:
+                core = core.replace(word, " ")
+            core = re.sub(r"\s+", "", core)
+            if len(core) < 2 or len(core) > 30:
+                continue
+            if not re.search(r"[\u3400-\u9fff]", core):
+                continue
+            # 纯标签/纯季集号（如「12集全」「中字」）不是片名
+            if re.fullmatch(r"[0-9０-９第季集期卷话話部共完结更新全]+", core):
+                continue
+            if not cls._informative(core):
+                continue
+            if core not in names:
+                names.append(core)
+        return names[:2]
+
+    @staticmethod
+    def _display_label(meta: Any) -> Tuple[str, str]:
+        """MP 实际解析出来的片名，用于徽标 tooltip 的诊断展示。
+
+        用户排查「明明库里有却判未入库」时，需要看到 MP 到底把这条发布名
+        认成了什么 —— 所以这里**只取 MP 的解析结果**，按 cn_name → en_name
+        → name 的顺序；拿不到就返回空（前端显示「未能解析出片名」），
+        绝不退回整条发布名，也不拿副标题里的中文名充数（那只是搜索补丁）。
+        """
+        if meta is None:
+            return "", ""
+        for key in ("cn_name", "en_name", "name"):
+            value = str(getattr(meta, key, None) or "").strip()
+            if value:
+                return value, key
+        return "", ""
 
     @staticmethod
     def _name_score(candidate: str, names: List[str]) -> int:
