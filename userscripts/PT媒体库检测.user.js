@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.3.3
+// @version      2.3.4
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @license      MIT
@@ -31,13 +31,16 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.3.3）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.3.4）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.3.4
+ *   · 详情页面板不再显示「路径」行（用户要求：长串无阅读价值，且指向 115 网盘）。
  *
  * v2.3.3
  *   · 仅更新发布页说明（不再列出适配站点名单），代码与 v2.3.2 完全一致。
@@ -1295,8 +1298,7 @@
         }).join(' ');
       rows.push(['在库季集', `<span style="color:#374151">${esc(txt)}</span>`]);
     }
-    if (q.path) rows.push(['路径', `<span style="color:#6b7280;word-break:break-all">${esc(q.path)}</span>`]);
-    // 库内才给播放按钮：两台服务器都有（插件返回 sources）就两个都显示
+    // 「路径」不显示了（用户要求）：一是长串没阅读价值，二是它其实指向 115 网盘
     const plays = playButtonsHtml(r);
     if (plays) rows.push(['在库播放', `<span class="ptmc-plays">${plays}</span>`]);
     if (r.in_servers && r.in_servers.length > 1) {
