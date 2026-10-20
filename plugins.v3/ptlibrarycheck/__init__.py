@@ -774,6 +774,13 @@ class PtLibraryCheck(_PluginBase):
                         except Exception as err:  # noqa: BLE001
                             errors.append(f"{n2}: {err}")
                             continue
+                        if dbg is not None:
+                            dbg.setdefault("backfill", []).append({
+                                "server": n2, "terms": list(recog_names),
+                                "got": len(more),
+                                "names": [str(it.get("title") or it.get("Name") or "")
+                                          for it in more[:5]],
+                            })
                         merged, seen2 = [], set()
                         for it2 in (items2 or []) + more:
                             k2 = it2.get("Id") or it2.get("ratingKey") or id(it2)
