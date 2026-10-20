@@ -46,8 +46,8 @@
 | `userscripts/PT媒体库检测.user.js` | **主交付物**。瘦油猴客户端，只存 MP 地址 |
 | `plugins.v3/ptlibrarycheck/__init__.py` | MP 插件 `PtLibraryCheck` |
 | `package.v3.json` | 插件市场索引（key = 插件类名） |
-| `tests/test_mp_plugin.py` | 插件单测（173 项，MP 模块全打桩） |
-| `tests/test_userscript.js` | 瘦客户端单测（27 项） |
+| `tests/test_mp_plugin.py` | 插件单测（201 项，MP 模块全打桩） |
+| `tests/test_userscript.js` | 瘦客户端单测（33 项） |
 
 ---
 
@@ -113,7 +113,7 @@ Tampermonkey → 新建脚本 → 粘贴 `PT媒体库检测.user.js` 全文 → 
 ## 四、插件接口
 
 ```http
-GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&imdb=tt1234567][&season=1][&episode=9]
+GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&imdb=tt1234567][&season=1][&episode=9][&priority=high]
 ```
 
 **识别顺序（v1.1.0 起）**：`imdb` 优先 —— 站点种子行里如果已填 IMDb
@@ -186,6 +186,8 @@ GET /api/v1/plugin/PtLibraryCheck/sites
 | 允许匿名访问查询接口 | 关 | 打开后油猴无需 MP API Key |
 | 查询剧集时返回具体分集是否在库 | 开 | |
 | 查询缓存小时数 | 24 | 0 = 不缓存 |
+| 并发上限 max_concurrent | 3 | 所有标签页共用的进程级闸门 |
+| 排队等待上限 gate_timeout | 25 | 秒；等超了返回 `busy: true` |
 
 ---
 
@@ -199,6 +201,61 @@ GET /api/v1/plugin/PtLibraryCheck/sites
 - 列表页一次会触发几十个查询，但全部走限流队列（默认并发 2、最小间隔 250ms），
   且 24 小时缓存，翻页重复项不会重复查
 - 不要把 `behavior.autoDetectSite` 打开去跑未验证的站点
+
+---
+
+## 五之二、多标签页并发与优先级队列
+
+**问题**：油猴是「每个标签页各跑一份」，页内限流管不住跨页并发 ——
+同时开 5 个站刷列表，就是 5 倍请求同时打进 MP，反代容易被拖到 504。
+
+**做法**：真正兜住的是插件进程里的那道闸（`_ConcurrencyGate`），
+油猴自己只做第一层。
+
+| 层 | 位置 | 默认 | 作用 |
+|---|---|---|---|
+| 页内队列 | 油猴 `queue` | 并发 2 / 间隔 250ms | hot（详情页）优先于 normal（列表页）出队 |
+| 进程闸门 | 插件 `_gate` | 并发 3 / 排队 25s | **所有标签页共用**，超了按优先级排队 |
+| 同题合并 | 插件 `_inflight` | — | 多个标签页问同一部片，只真查一次 |
+| 结果缓存 | 插件 `data` | 24h | 同一条重复出现不再查 |
+
+优先级：详情页 / 手动操作传 `priority=high`，列表页默认 `normal`；
+插队只在**排队时**生效（已经在跑的查询不会被抢占）。
+
+闸门排满且等满 `gate_timeout` 时，`/check` 返回：
+
+```json
+{"success": true, "data": {
+  "found": false, "timeout": true, "busy": true,
+  "reason": "查询排队超时（并发上限 3，等满 25s）"
+}}
+```
+
+`busy: true` 表示「没查到，不是没有」。油猴据此显示橙色「排队中」并自动重试
+（4s、8s，共 2 次），**不写缓存**，绝不会把排队超时记成「未入库」。
+
+同题合并命中时返回体多一个 `coalesced: true`（表示结果来自别的标签页的同一次查询，
+不是自己那份数据的重新计算）。
+
+排查用：
+
+```http
+GET /api/v1/plugin/PtLibraryCheck/stats
+{"success": true, "data": {"limit": 3, "active": 2, "waiting": 1,
+                           "peak": 3, "rejected": 0, "gate_timeout": 25}}
+```
+
+`rejected` 就是「排队超时被拒」的累计次数 —— 这个数一直涨，说明该调大
+并发上限或减少同时开着的标签页。
+
+**关于「复用 MP 缓存、少打 TMDb」**：MP 自己的 `TmdbCache`
+（`app/modules/themoviedb/cache.py`，TTL = 媒体元数据缓存天数）本来就拦着
+重复的 TMDb 请求，插件识别时显式传 `cache=True` 走它。所以：
+
+- 同一部片反复出现 → 命中 MP 的 TMDb 缓存，不产生新的 TMDb 调用；
+- 第一轮只用本地 `MetaInfo` 解析出的片名搜媒体库，**片名完全相同就返回**，
+  只有第一轮没找准才做标题识别（硬超时 6s）——大部分查询根本不碰 TMDb；
+- 插件自己还有 24h 结果缓存（key 带插件版本号），重复标题连媒体服务器都不查。
 
 ---
 
@@ -255,13 +312,13 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 
 ```bash
 # MP 插件（把 MP 模块全打桩，不依赖真实 MP）
-python tests/test_mp_plugin.py          # 173 项
+python tests/test_mp_plugin.py          # 201 项
 
 # 油猴（Node 自带 test runner + jsdom）
-node tests/test_userscript.js           # 27 项
+node tests/test_userscript.js           # 33 项
 ```
 
-当前状态：**200 项全过**。
+当前状态：**234 项全过**。
 
 ---
 

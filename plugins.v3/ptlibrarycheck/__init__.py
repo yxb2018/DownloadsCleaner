@@ -14,6 +14,7 @@
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
 """
 
+import asyncio
 import hashlib
 import inspect
 import re
@@ -90,6 +91,72 @@ def _host_of(value: str) -> str:
     return host
 
 
+class _ConcurrencyGate:
+    """全局并发闸门 + 优先级队列（进程内唯一）。
+
+    油猴每个标签页各跑一份，页内的限流管不住「同时开 5 个站 = 5 倍并发」。
+    真正能兜住的是插件进程里的这道闸：所有 /check 先过闸，
+    详情页 / 手动刷新用 high 优先级插队，列表页 normal 排队，
+    等太久（默认 25s）就带着「排队超时」返回，别把反代拖到 504。
+    """
+
+    HIGH = 0
+    NORMAL = 1
+
+    def __init__(self, limit: int = 3) -> None:
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiters: List[Tuple[int, int]] = []   # [(priority, seq)]
+        self._seq = 0
+        self._peak = 0
+        self._rejected = 0
+        self._cond = threading.Condition()
+
+    def set_limit(self, limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, int(limit))
+            self._cond.notify_all()
+
+    def acquire(self, priority: int = NORMAL, timeout: float = 25.0) -> bool:
+        """拿到一个执行位就返回 True；超时返回 False（调用方回「排队超时」）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+        with self._cond:
+            self._seq += 1
+            ticket = (int(priority), self._seq)
+            self._waiters.append(ticket)
+            while True:
+                self._waiters.sort()
+                if self._waiters and self._waiters[0] == ticket \
+                        and self._active < self._limit:
+                    self._waiters.remove(ticket)
+                    self._active += 1
+                    self._peak = max(self._peak, self._active)
+                    return True
+                remain = deadline - time.time()
+                if remain <= 0:
+                    if ticket in self._waiters:
+                        self._waiters.remove(ticket)
+                    self._rejected += 1
+                    return False
+                self._cond.wait(min(remain, 0.5))
+
+    def release(self) -> None:
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    def stats(self) -> Dict[str, Any]:
+        with self._cond:
+            return {
+                "limit": self._limit,
+                "active": self._active,
+                "waiting": len(self._waiters),
+                "peak": self._peak,
+                "rejected": self._rejected,
+            }
+
+
+
 class PtLibraryCheck(_PluginBase):
     """PT 站点媒体库存在性与画质查询。"""
 
@@ -97,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.9"
+    plugin_version = "1.1.10"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -116,6 +183,12 @@ class PtLibraryCheck(_PluginBase):
     _recognize_timeout = 6
     # 站点域名清单的内存缓存：(时间戳, 载荷)。MP 的站点表不常变，5 分钟足够。
     _sites_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+    # 进程级并发闸门（所有标签页共用）与「同题合并」表
+    _gate = _ConcurrencyGate(3)
+    _gate_timeout = 25.0
+    _flight_lock = threading.Lock()
+    _inflight: Dict[str, threading.Event] = {}
+    _flight_results: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -140,11 +213,17 @@ class PtLibraryCheck(_PluginBase):
         for attr, key, default in (
             ("_total_timeout", "total_timeout", 20),
             ("_recognize_timeout", "recognize_timeout", 6),
+            ("_gate_timeout", "gate_timeout", 25),
         ):
             try:
                 setattr(self, attr, max(1, int(config.get(key) or default)))
             except (TypeError, ValueError):
                 setattr(self, attr, default)
+        # 并发上限是进程级的，配置改了立刻对所有标签页生效
+        try:
+            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 3)))
+        except (TypeError, ValueError):
+            self._gate.set_limit(3)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -215,6 +294,22 @@ class PtLibraryCheck(_PluginBase):
                             "type": "number",
                         },
                     },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "max_concurrent",
+                            "label": "并发上限（所有标签页合计，建议 3；0 或空按 3）",
+                            "type": "number",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "gate_timeout",
+                            "label": "排队等待上限（秒，建议 25；超时返回「查询排队超时」）",
+                            "type": "number",
+                        },
+                    },
                 ],
             }
         ], {
@@ -224,6 +319,8 @@ class PtLibraryCheck(_PluginBase):
             "cache_hours": 24,
             "total_timeout": 20,
             "recognize_timeout": 6,
+            "max_concurrent": 3,
+            "gate_timeout": 25,
         }
 
     # ------------------------------------------------------------------
@@ -247,6 +344,15 @@ class PtLibraryCheck(_PluginBase):
                                "站点改域名后不必改脚本（只需在 MP 里更新站点地址）",
             },
             {
+                "path": "/stats",
+                "endpoint": self.stats,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "allow_anonymous": self._allow_anonymous,
+                "summary": "查看并发闸门当前状态（active/排队/峰值/被拒）",
+                "description": "排查「开了多个标签页后查询变慢」时用：active 到 limit 就说明在排队",
+            },
+            {
                 "path": "/check",
                 "endpoint": self.check,
                 "methods": ["GET", "POST"],
@@ -257,6 +363,15 @@ class PtLibraryCheck(_PluginBase):
                                "返回存在性、在库版本画质与分集情况",
             }
         ]
+
+    async def stats(self) -> Dict[str, Any]:
+        """并发闸门状态：给排查「多标签同时查询」用。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        data = self._gate.stats()
+        data["gate_timeout"] = self._gate_timeout
+        data["cache_hours"] = self._cache_hours
+        return {"success": True, "data": data}
 
     async def sites(self) -> Dict[str, Any]:
         """站点清单：以 MP 站点表为准，避免油猴里硬编码域名过期。
@@ -325,7 +440,8 @@ class PtLibraryCheck(_PluginBase):
                     season: Optional[int] = None,
                     episode: Optional[int] = None,
                     imdb: str = "",
-                    debug: int = 0) -> Dict[str, Any]:
+                    debug: int = 0,
+                    priority: str = "normal") -> Dict[str, Any]:
         """查询入口。阻塞的媒体服务器调用放到线程池，避免卡住事件循环。
 
         imdb 优先：站点种子页已填 IMDb 时传进来，识别更快也更准；
@@ -333,22 +449,99 @@ class PtLibraryCheck(_PluginBase):
 
         debug=1 时在返回体里附带解析结果、各阶段耗时与匹配置信度，便于排查
         「为什么这个是未入库 / 为什么这么慢」，正常调用不带这个字段。
+
+        priority=high 走插队（详情页/手动刷新），normal 排队（列表页批量）。
+        同一标题同时被多个标签页查询时只算一次（single-flight），
+        重复的请求直接等结果，不再压媒体服务器。
         """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         title = (title or "").strip()
+        subtitle = (subtitle or "").strip()
         imdb = _normalize_imdb(imdb)
         if not title and not imdb:
             return {"success": False, "message": "缺少 title 或 imdb 参数"}
-        import asyncio
+
+        is_debug = bool(debug)
+        prio = self._gate.HIGH if str(priority).lower() in ("high", "hot", "1") else self._gate.NORMAL
+        # 同题合并：debug 请求要真实数据，不参与合并
+        sig = ""
+        if not is_debug:
+            sig = hashlib.md5(
+                f"{imdb}|{title}\n{subtitle}|{season}|{episode}".encode("utf-8")
+            ).hexdigest()[:16]
+            owner, event = self._join_flight(sig)
+            if not owner:
+                if event.wait(max(1.0, self._gate_timeout)):
+                    shared = self._take_flight_result(sig)
+                    if shared is not None:
+                        return {"success": True, "data": shared, "coalesced": True}
+                # 对方超时/出错，自己再查一次（可能直接命中缓存）
+
         try:
-            data = await asyncio.to_thread(
-                self._query, title, (subtitle or "").strip(), season, episode,
-                imdb, bool(debug),
-            )
+            if not self._gate.acquire(prio, self._gate_timeout):
+                # 排队超时：必须把同题登记撤掉，否则后来的同题请求会一直等这个
+                # 永远不会 set 的事件，白等一整个 gate_timeout
+                self._finish_flight(sig, None)
+                return {"success": True, "data": {
+                    "found": False, "timeout": True, "busy": True,
+                    "reason": f"查询排队超时（并发上限 {self._gate.stats()['limit']}，"
+                              f"等满 {int(self._gate_timeout)}s）",
+                    "title": title,
+                }}
+            try:
+                data = await asyncio.to_thread(
+                    self._query, title, subtitle, season, episode, imdb, is_debug,
+                )
+            finally:
+                self._gate.release()
         except Exception as err:  # noqa: BLE001 - 接口不能把异常抛给前端
+            if sig:
+                self._finish_flight(sig, None)
             return {"success": False, "message": f"查询失败：{err}"}
+        if sig:
+            self._finish_flight(sig, data)
         return {"success": True, "data": data}
+
+    # ---- 同题合并（single-flight）------------------------------------
+    def _join_flight(self, sig: str) -> Tuple[bool, threading.Event]:
+        """返回 (是否由我执行, 事件)。非执行者等事件即可拿结果。"""
+        with self._flight_lock:
+            event = self._inflight.get(sig)
+            if event is not None:
+                return False, event
+            event = threading.Event()
+            self._inflight[sig] = event
+            return True, event
+
+    def _finish_flight(self, sig: str, result: Optional[Dict[str, Any]]) -> None:
+        with self._flight_lock:
+            event = self._inflight.pop(sig, None)
+            if result is not None:
+                now = time.time()
+                self._flight_results[sig] = (now, result)
+                # 结果对所有等待者共用（不是取走即删），60s 后过期；
+                # 再兜一个数量上限，避免长期运行把内存吃掉
+                if len(self._flight_results) > 512:
+                    for key in list(self._flight_results)[:256]:
+                        self._flight_results.pop(key, None)
+                else:
+                    for key in [k for k, v in self._flight_results.items()
+                                if now - v[0] > 60]:
+                        self._flight_results.pop(key, None)
+            if event is not None:
+                event.set()
+
+    def _take_flight_result(self, sig: str) -> Optional[Dict[str, Any]]:
+        """读（不删）同题合并的结果，多个等待者都能拿到同一份。"""
+        with self._flight_lock:
+            entry = self._flight_results.get(sig)
+            if not entry:
+                return None
+            if time.time() - entry[0] > 60:
+                self._flight_results.pop(sig, None)
+                return None
+            return entry[1]
 
     # ------------------------------------------------------------------
     # 查询主流程
@@ -705,7 +898,11 @@ class PtLibraryCheck(_PluginBase):
                 if not fn:
                     continue
                 for source in ((MediaSource.IMDb, "imdb") if MediaSource is not None else ()):
+                    # cache=True 是 MP 的默认值，这里显式写出来：同一条 imdb 反复出现时
+                    # 直接吃 MP 的 TMDb 缓存（TmdbCache），不再打 TMDb 接口
                     info = self._call_adaptive(fn, (
+                        {"media_source": source, "media_id": imdb, "mtype": mtype, "cache": True},
+                        {"media_source": source, "media_id": imdb, "cache": True},
                         {"media_source": source, "media_id": imdb, "mtype": mtype},
                         {"media_source": source, "media_id": imdb},
                     ))
@@ -719,6 +916,8 @@ class PtLibraryCheck(_PluginBase):
             if not fn:
                 continue
             info = self._call_adaptive(fn, (
+                {"metainfo": meta, "mtype": mtype, "cache": True},
+                {"meta": meta, "mtype": mtype, "cache": True},
                 {"metainfo": meta, "mtype": mtype},
                 {"meta": meta, "mtype": mtype},
                 {"metainfo": meta},

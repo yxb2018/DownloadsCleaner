@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.2.1
+// @version      2.2.2
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @match        *://*.audiences.me/*
@@ -28,13 +28,21 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.2.1）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.2.2）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.2.2
+ *   · 多标签页并发治理（配套插件 1.1.10）：
+ *     - 详情页 / 手动操作走 priority=high，列表页默认排队；页面内的请求队列
+ *       也分成 hot / normal 两级，详情页那条不用排在 100 条列表后面。
+ *     - 插件侧闸门排队超时（busy=true / timeout=true）不再当「未入库」，
+ *       改显示橙色「排队中」，并按 busyRetryMs 自动重试（默认 4s、8s，共 2 次）；
+ *       这类结果不写缓存，避免这一行把「排队中」记成结论。
  *
  * v2.2.1
  *   · 适配听听歌(TTG, totheglory.im)：它和 NexusPHP 通用结构不一样——
@@ -78,8 +86,9 @@
  *   · 分辨率、DoVi、音轨、字幕等详细信息只在详情页面板展示。
  *
  * 依赖：MP 已安装并启用 PtLibraryCheck 插件（plugins.v3/ptlibrarycheck）。
- *       接口：GET {mp.host}/api/v1/plugin/PtLibraryCheck/check?title=..&subtitle=..
+ *       接口：GET {mp.host}/api/v1/plugin/PtLibraryCheck/check?title=..&subtitle=..&priority=..
  *            GET {mp.host}/api/v1/plugin/PtLibraryCheck/sites
+ *            GET {mp.host}/api/v1/plugin/PtLibraryCheck/stats（并发闸门状态，排查用）
  * =====================================================================
  */
 
@@ -127,6 +136,10 @@
       retries: 2,            // 网络错误/超时/5xx 的重试次数（0 = 不重试）
       retryDelayMs: 400,     // 首次重试等待，之后按次数线性递增
       badgeCompact: true,    // 列表页用紧凑徽标
+      // 插件侧并发闸门排队超时（同时开了很多标签页）时的自动重试：
+      // 第一次等 busyRetryMs，第二次等 2 倍，最多 busyRetries 次
+      busyRetries: 2,
+      busyRetryMs: 4000,
     },
   };
 
@@ -205,23 +218,27 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.2.1';
+    return '2.2.2';
   })();
 
-  // 限流队列：全局串行 + 最小间隔
+  // 限流队列：全局串行 + 最小间隔 + 两级优先级
+  //   hot  详情页 / 手动刷新 —— 你正在看的那条，先出队
+  //   tasks 列表页批量 —— 慢慢跑，不抢详情页的位
   const queue = {
     running: 0,
     last: 0,
-    tasks: [],
-    push(fn) {
+    tasks: [],       // normal
+    hot: [],         // high
+    push(fn, priority) {
+      const isHot = String(priority || '').toLowerCase() === 'high';
       return new Promise((resolve, reject) => {
-        this.tasks.push({ fn, resolve, reject });
+        (isHot ? this.hot : this.tasks).push({ fn, resolve, reject });
         this._next();
       });
     },
     _next() {
-      while (this.running < CONFIG.behavior.concurrency && this.tasks.length) {
-        const task = this.tasks.shift();
+      while (this.running < CONFIG.behavior.concurrency && (this.hot.length || this.tasks.length)) {
+        const task = this.hot.length ? this.hot.shift() : this.tasks.shift();
         this.running++;
         const gap = CONFIG.behavior.minIntervalMs - (Date.now() - this.last);
         setTimeout(async () => {
@@ -295,9 +312,11 @@
    * 所以网络错误 / 超时 / 5xx 会自动重试 2 次（共 3 次），4xx 与业务失败不重试。
    * @param {string} rawTitle 标题行 + 换行 + 副标题
    * @param {string} [imdb]  站点已填的 IMDb ID（tt1234567），有就走 IMDb 直查
+   * @param {string} [priority] 'high' 走插件侧的插队（详情页/手动刷新），默认排队
    * @returns {Promise<{found, type, title, year, quality, seasons, episode, server, reason}>}
    */
-  function checkLibrary(rawTitle, imdb) {
+  function checkLibrary(rawTitle, imdb, priority) {
+    const isHot = String(priority || '').toLowerCase() === 'high';
     return queue.push(async () => {
       const host = mpHost();
       if (!host) {
@@ -309,7 +328,8 @@
       const url = `${host}${CONFIG.apiPath}`
         + `?title=${encodeURIComponent(title)}`
         + (subtitle ? `&subtitle=${encodeURIComponent(subtitle)}` : '')
-        + (imdb ? `&imdb=${encodeURIComponent(imdb)}` : '');
+        + (imdb ? `&imdb=${encodeURIComponent(imdb)}` : '')
+        + (isHot ? '&priority=high' : '');
       const headers = { Accept: 'application/json' };
       const key = mpKey();
       if (key) headers['X-API-KEY'] = key;
@@ -329,18 +349,29 @@
         }
       }
       throw lastErr || new Error('查询失败');
-    });
+    }, priority);
   }
 
   const checkCache = new Map();
-  async function checkTorrentCached(rawTitle, imdb) {
+  /** 排队超时的结果不是结论，不能写缓存 —— 否则这一行会「记住」未入库 */
+  function isBusy(r) {
+    return !!(r && (r.busy === true || r.timeout === true));
+  }
+
+  async function checkTorrentCached(rawTitle, imdb, priority) {
     // 有 IMDb 时以 IMDb 为主键：同一部片子不同压制版本可共用一次查询结果
     const key = `mp|${imdb || ''}|${rawTitle}`;
-    if (checkCache.has(key)) return checkCache.get(key);
-    const hit = cacheGet('chk_' + hash(SCRIPT_VER + '|' + key), CONFIG.behavior.cacheHours * 3600e3);
-    if (hit) { checkCache.set(key, hit); return hit; }
-    const p = checkLibrary(rawTitle, imdb).then((r) => {
-      cacheSet('chk_' + hash(SCRIPT_VER + '|' + key), r);
+    const mem = checkCache.get(key);
+    if (mem) {
+      const val = await mem;                      // 可能是 Promise，也可能已是结果
+      if (!isBusy(val)) return val;
+      checkCache.delete(key);                     // 上次是排队超时，这次重查
+    }
+    const storeKey = 'chk_' + hash(SCRIPT_VER + '|' + key);
+    const hit = cacheGet(storeKey, CONFIG.behavior.cacheHours * 3600e3);
+    if (hit && !isBusy(hit)) { checkCache.set(key, Promise.resolve(hit)); return hit; }
+    const p = checkLibrary(rawTitle, imdb, priority).then((r) => {
+      if (!isBusy(r)) cacheSet(storeKey, r);
       return r;
     })
       .catch((e) => ({ found: false, error: e.message }));
@@ -639,6 +670,7 @@
   .ptmc-badge.out{background:#f2f2f3;color:#8a8f98;border:1px solid #e2e4e7}
   .ptmc-badge.err{background:#fdecea;color:#c0392b;border:1px solid #f5c6c0}
   .ptmc-badge.load{background:#eef4ff;color:#4a6cf7;border:1px solid #d6e2ff}
+  .ptmc-badge.wait{background:#fff4e5;color:#a35f00;border:1px solid #f3dbb5}
   .ptmc-panel{margin:8px 0 12px;padding:10px 12px;border:1px solid #d8dce3;border-radius:6px;
     background:#fafbfc;font-size:13px;line-height:1.7;font-family:system-ui,"Microsoft YaHei",sans-serif}
   .ptmc-panel .t{font-weight:600;margin-bottom:4px}
@@ -686,9 +718,16 @@
     return `<span class="ptmc-badge err" title="${esc(msg || '查询失败')}">查询失败</span>`;
   }
 
+  /** 插件侧并发闸门排队超时（多个标签页同时刷）——这不是「未入库」，
+   *  给橙色「排队中」，稍后自动重试。 */
+  function listBusyHtml(msg) {
+    return `<span class="ptmc-badge wait" title="${esc(msg || '查询排队中，稍后自动重试')}">排队中</span>`;
+  }
+
   function badgeHtml(r) {
     if (r && r.error) return listFailHtml(r.error);
     if (!r) return listPendingHtml();
+    if (isBusy(r)) return listBusyHtml(r.reason);
     if (r.found) {
       const ep = r.episode;
       if (ep && ep.found === false) {
@@ -715,6 +754,10 @@
   function panelHtml(r, rawTitle) {
     if (r && r.error) return `<div class="ptmc-panel"><div class="t">媒体库查询失败：${esc(r.error)}</div></div>`;
     if (!r) return `<div class="ptmc-panel"><div class="t">媒体库查询中…</div></div>`;
+    if (isBusy(r)) {
+      return `<div class="ptmc-panel"><div class="t">媒体库查询排队中…</div>
+        <div style="color:#6b7280;font-size:12px">${esc(r.reason || '同时查询的页面太多，已排队等待')}，稍后自动重试。</div></div>`;
+    }
     const head = (rawTitle || '').split('\n')[0];
     if (!r.found) {
       // MP 解析结果如实展示（诊断用）；解析不出来就说解析不出来，不用发布名顶替
@@ -789,14 +832,29 @@
       (it.anchor || it.link).insertAdjacentElement('afterend', holder);
       // 标题行 + 副标题合并送检：片名取标题行，分辨率/季集等质量标签全文匹配
       const raw = it.subtitle ? `${it.title}\n${it.subtitle}` : it.title;
-      const r = await checkTorrentCached(raw, it.imdb);
-      if (r && r.error) {
-        warnOnce(r.error);
-        holder.innerHTML = listFailHtml(r.error);
-        continue;
-      }
-      holder.innerHTML = badgeHtml(r);
+      await fillListBadge(holder, raw, it.imdb, 0);
     }
+  }
+
+  /** 列表行徽标填充：排队超时不算结论，隔一会儿自动重试（最多 busyRetries 次） */
+  async function fillListBadge(holder, raw, imdb, attempt) {
+    if (!holder.isConnected) return;               // 页面已刷新/行已移除
+    const r = await checkTorrentCached(raw, imdb, 'normal');
+    if (r && r.error) {
+      warnOnce(r.error);
+      holder.innerHTML = listFailHtml(r.error);
+      return;
+    }
+    if (isBusy(r)) {
+      holder.innerHTML = listBusyHtml(r.reason);
+      const max = Math.max(0, Number(CONFIG.behavior.busyRetries) || 0);
+      if (attempt < max) {
+        const wait = Math.max(1000, Number(CONFIG.behavior.busyRetryMs) || 4000);
+        setTimeout(() => { fillListBadge(holder, raw, imdb, attempt + 1); }, wait * (attempt + 1));
+      }
+      return;
+    }
+    holder.innerHTML = badgeHtml(r);
   }
 
   // 列表页查询失败只在控制台提示一次（页面上不显示错误徽标）
@@ -817,8 +875,21 @@
     d.el.insertAdjacentElement('afterend', host);
     host.innerHTML = panelHtml(null, d.title);
     const raw = d.subtitle ? `${d.title}\n${d.subtitle}` : d.title;
-    const r = await checkTorrentCached(raw, d.imdb);
+    // 详情页是你正在看的那条：走 high 优先级，插件侧插队、页内也插队
+    await fillDetailPanel(host, raw, d.imdb, 0);
+  }
+
+  async function fillDetailPanel(host, raw, imdb, attempt) {
+    if (!host.isConnected) return;
+    const r = await checkTorrentCached(raw, imdb, 'high');
     host.innerHTML = panelHtml(r, raw);
+    if (isBusy(r)) {
+      const max = Math.max(0, Number(CONFIG.behavior.busyRetries) || 0);
+      if (attempt < max) {
+        const wait = Math.max(1000, Number(CONFIG.behavior.busyRetryMs) || 4000);
+        setTimeout(() => { fillDetailPanel(host, raw, imdb, attempt + 1); }, wait * (attempt + 1));
+      }
+    }
   }
 
   async function run() {
@@ -863,7 +934,7 @@
     GM_registerMenuCommand('③ 测试连通性', () => {
       const host = mpHost();
       if (!host) { alert('先设置 MP 地址：油猴菜单 → ① 设置 MP 地址与 API Key'); return; }
-      const url = `${host}${CONFIG.apiPath}?title=test`;
+      const url = `${host}${CONFIG.apiPath}?title=test&priority=high`;
       GM_xmlhttpRequest({
         method: 'GET', url,
         headers: Object.assign({ Accept: 'application/json' }, mpKey() ? { 'X-API-KEY': mpKey() } : {}),
@@ -908,7 +979,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       CONFIG, BUILTIN_SITES, ADAPTED_SITE_NAMES, hash, badgeHtml, listPendingHtml, listFailHtml,
-      panelHtml, tagsHtml,
+      listBusyHtml, isBusy, panelHtml, tagsHtml, queue,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       collectNexusItems, collectTtgItems, splitByBr,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
