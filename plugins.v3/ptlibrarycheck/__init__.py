@@ -53,7 +53,7 @@ class PtLibraryCheck(_PluginBase):
 
     plugin_name = "PT媒体库检测"
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询（复用 MP 已配置的媒体服务器）"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "local"
     plugin_label = "媒体库"
     plugin_order = 100
@@ -417,9 +417,14 @@ class PtLibraryCheck(_PluginBase):
                 collected[idx] = (name, server, stype, merged)
 
         # 4. 第二轮判定：带上 tmdb_id / 全部片名重新评分
-        for name, server, stype, items in collected:
+        for idx, (name, server, stype, items) in enumerate(collected):
             best = self._pick_best_scored(items, names, year, tmdb_id,
                                          emby=(stype != "plex"), imdb=imdb)
+            if dbg is not None and idx < len(dbg["servers"]):
+                dbg["servers"][idx]["best2"] = (
+                    best[0].get("Name") or best[0].get("title")
+                    or best[0].get("originalTitle")) if best else None
+                dbg["servers"][idx]["score2"] = best[1] if best else 0
             if not best:
                 continue
             hit = self._hit_result(name, stype, server, best[0], is_tv,
@@ -955,6 +960,7 @@ class PtLibraryCheck(_PluginBase):
             getattr(meta, "cn_name", None),
             getattr(meta, "en_name", None),
             getattr(meta, "original_name", None),
+            getattr(meta, "name", None),
             getattr(meta, "title", None),
         ):
             if not value:
@@ -1031,16 +1037,19 @@ class PtLibraryCheck(_PluginBase):
         scored = []
         for it in items:
             if emby:
-                cand_name = it.get("Name") or it.get("OriginalTitle") or ""
+                # 中英文名都参与比对：库里的主名可能是译名，原名在 OriginalTitle 里
+                cand_names = [it.get("Name"), it.get("OriginalTitle")]
                 cand_year = it.get("ProductionYear")
                 cand_tmdb = ((it.get("ProviderIds") or {}).get("Tmdb"))
             else:
-                cand_name = it.get("title") or ""
+                # Plex 搜索结果的 title 是显示名（可能是中文译名），
+                # 原名在 originalTitle / titleSort 里 —— 只比 title 会漏掉一堆在库条目
+                cand_names = [it.get("title"), it.get("originalTitle"), it.get("titleSort")]
                 cand_year = it.get("year")
                 guid = it.get("guid") or ""
                 m = re.search(r"tmdb://(\d+)", guid)
                 cand_tmdb = m.group(1) if m else None
-            score = self._name_score(cand_name, names)
+            score = max((self._name_score(n, names) for n in cand_names if n), default=0)
             if imdb and self._item_imdb(it, emby) == imdb:
                 # IMDb 是硬身份：命中就不再看片名像不像
                 score += 400
