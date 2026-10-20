@@ -14,6 +14,7 @@
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
 """
 
+import inspect
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,7 +52,7 @@ class PtLibraryCheck(_PluginBase):
 
     plugin_name = "PT媒体库检测"
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询（复用 MP 已配置的媒体服务器）"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "local"
     plugin_label = "媒体库"
     plugin_order = 100
@@ -280,6 +281,9 @@ class PtLibraryCheck(_PluginBase):
                 return hit
 
         reason = "媒体库无此资源"
+        if not names:
+            # 只给 imdb 没给标题：Emby/Jellyfin 能直查，Plex 只能按片名搜
+            reason += "（只传 imdb 时 Plex 无法定位，请同时传 title）"
         if errors:
             reason += "（" + "；".join(errors[:2]) + "）"
         out = {"found": False, "reason": reason, "title": title}
@@ -293,39 +297,69 @@ class PtLibraryCheck(_PluginBase):
     def _recognize(self, meta: Any, is_tv: bool, imdb: str) -> Any:
         """优先用 IMDb 直查媒体信息，失败再退回标题识别。
 
-        MP 各版本识别签名差异较大：
-          v3.1.x → recognize_media(media_source=MediaSource.IMDb, media_id=..)
-          更早   → recognize_media(meta=..) / recognize_by_meta(meta)
-        全部 try 一遍，能拿到就用；拿不到不阻断查询（还有按名搜索兜底）。
+        MP 各版本识别签名差异很大（同一个函数名，参数名从 meta 改成 metainfo、
+        又新增了 media_source/media_id 身份识别），硬编码任何一种都会在别的版本上
+        TypeError。所以这里先读函数签名，只提交对方真正接受的参数，逐个候选尝试：
+
+          · 身份识别   recognize_media(media_source=MediaSource.IMDb, media_id="tt…")
+          · 标题识别   recognize_by_meta(metainfo=…) / (meta=…)
+        全都拿不到也不阻断查询 —— 后面还有按片名搜索兜底。
         """
         chain = MediaChain()
         mtype = MediaType.TV if is_tv else MediaType.MOVIE
 
-        if imdb and MediaSource is not None:
-            for source in (MediaSource.IMDb, "imdb"):
-                fn = getattr(chain, "recognize_media", None)
+        if imdb:
+            for fn_name in ("recognize_media", "recognize_by_meta"):
+                fn = getattr(chain, fn_name, None)
                 if not fn:
-                    break
-                try:
-                    info = fn(media_source=source, media_id=imdb, mtype=mtype)
+                    continue
+                for source in ((MediaSource.IMDb, "imdb") if MediaSource is not None else ()):
+                    info = self._call_adaptive(fn, (
+                        {"media_source": source, "media_id": imdb, "mtype": mtype},
+                        {"media_source": source, "media_id": imdb},
+                    ))
                     if info:
                         return info
-                except Exception as err:  # noqa: BLE001
-                    self._log(f"IMDb 识别失败（{source}）：{err}")
 
-        for fn_name, kwargs in (
-            ("recognize_media", {"meta": meta, "mtype": mtype}),
-            ("recognize_by_meta", {"meta": meta}),
-        ):
+        if meta is None:
+            return None
+        for fn_name in ("recognize_by_meta", "recognize_media"):
             fn = getattr(chain, fn_name, None)
-            if not fn or meta is None:
+            if not fn:
+                continue
+            info = self._call_adaptive(fn, (
+                {"metainfo": meta, "mtype": mtype},
+                {"meta": meta, "mtype": mtype},
+                {"metainfo": meta},
+                {"meta": meta},
+            ))
+            if info:
+                return info
+        return None
+
+    def _call_adaptive(self, fn: Any, candidates: Tuple[Dict[str, Any], ...]) -> Any:
+        """按函数签名挑一组对方真能接受的参数调用；全都不匹配/失败则返回 None。
+
+        跨 MP 版本的关键：签名里没有的关键字坚决不传（否则 TypeError 被上层吞掉，
+        表现成「识别不到」，极难排查）。
+        """
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts_any = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        for kwargs in candidates:
+            if not accepts_any and not all(k in params for k in kwargs):
                 continue
             try:
                 info = fn(**kwargs)
-                if info:
-                    return info
-            except Exception as err:  # noqa: BLE001 - 识别失败不该阻断查询
-                self._log(f"{fn_name} 识别失败：{err}")
+            except Exception as err:  # noqa: BLE001 - 单个候选失败就换下一个
+                self._log(f"{getattr(fn, '__name__', 'recognize')} 调用失败：{err}")
+                continue
+            if info:
+                return info
         return None
 
     # ------------------------------------------------------------------
