@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.2.2
+// @version      2.2.3
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @match        *://*.audiences.me/*
@@ -28,13 +28,21 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.2.2）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.2.3）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.2.3
+ *   · 列表页 / 详情页两级查询（配套插件 1.1.11）：
+ *     - 列表页只查「在不在库里」（lite=1），不再为画质/季集/分集额外打媒体服务器；
+ *       剧集因此不在列表页显示缺集，画质等信息只在详情页给。
+ *     - 详情页先用列表页已经查到的结论铺上（peek 本地缓存，不重新请求、不重新识别），
+ *       同时打一次 full 查询补全画质 / 季集 / 缺集，回来再替换。
+ *     - 打开过详情页的行，缓存里已有全量结论，列表页直接显示（含缺集）。
  *
  * v2.2.2
  *   · 多标签页并发治理（配套插件 1.1.10）：
@@ -86,7 +94,7 @@
  *   · 分辨率、DoVi、音轨、字幕等详细信息只在详情页面板展示。
  *
  * 依赖：MP 已安装并启用 PtLibraryCheck 插件（plugins.v3/ptlibrarycheck）。
- *       接口：GET {mp.host}/api/v1/plugin/PtLibraryCheck/check?title=..&subtitle=..&priority=..
+ *       接口：GET {mp.host}/api/v1/plugin/PtLibraryCheck/check?title=..&subtitle=..&priority=..&lite=..
  *            GET {mp.host}/api/v1/plugin/PtLibraryCheck/sites
  *            GET {mp.host}/api/v1/plugin/PtLibraryCheck/stats（并发闸门状态，排查用）
  * =====================================================================
@@ -218,7 +226,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.2.2';
+    return '2.2.3';
   })();
 
   // 限流队列：全局串行 + 最小间隔 + 两级优先级
@@ -313,9 +321,10 @@
    * @param {string} rawTitle 标题行 + 换行 + 副标题
    * @param {string} [imdb]  站点已填的 IMDb ID（tt1234567），有就走 IMDb 直查
    * @param {string} [priority] 'high' 走插件侧的插队（详情页/手动刷新），默认排队
+   * @param {boolean} [lite]   true = 浅查询：只要「在不在库里」，不要画质/季集
    * @returns {Promise<{found, type, title, year, quality, seasons, episode, server, reason}>}
    */
-  function checkLibrary(rawTitle, imdb, priority) {
+  function checkLibrary(rawTitle, imdb, priority, lite) {
     const isHot = String(priority || '').toLowerCase() === 'high';
     return queue.push(async () => {
       const host = mpHost();
@@ -329,7 +338,8 @@
         + `?title=${encodeURIComponent(title)}`
         + (subtitle ? `&subtitle=${encodeURIComponent(subtitle)}` : '')
         + (imdb ? `&imdb=${encodeURIComponent(imdb)}` : '')
-        + (isHot ? '&priority=high' : '');
+        + (isHot ? '&priority=high' : '')
+        + (lite ? '&lite=1' : '');
       const headers = { Accept: 'application/json' };
       const key = mpKey();
       if (key) headers['X-API-KEY'] = key;
@@ -352,26 +362,78 @@
     }, priority);
   }
 
-  const checkCache = new Map();
+  const checkCache = new Map();      // key -> Promise（进行中或已完成的请求）
+  const resultCache = new Map();     // key -> 已拿到的结果（同步可读，详情页首屏要用）
   /** 排队超时的结果不是结论，不能写缓存 —— 否则这一行会「记住」未入库 */
   function isBusy(r) {
     return !!(r && (r.busy === true || r.timeout === true));
   }
 
-  async function checkTorrentCached(rawTitle, imdb, priority) {
+  /** 缓存键：full / lite 分开（lite 少画质与季集，不能当 full 用） */
+  function cacheKeysOf(rawTitle, imdb) {
+    const base = `mp|${imdb || ''}|${rawTitle}`;
+    return {
+      full: base + '|full',
+      lite: base + '|lite',
+      storeFull: 'chk_' + hash(SCRIPT_VER + '|' + base + '|full'),
+      storeLite: 'chk_' + hash(SCRIPT_VER + '|' + base + '|lite'),
+    };
+  }
+
+  /** 同步读已有结论（不发请求）——详情页首屏先用列表页那条结论铺上 */
+  function peekCached(rawTitle, imdb) {
+    const k = cacheKeysOf(rawTitle, imdb);
+    const ttl = CONFIG.behavior.cacheHours * 3600e3;
+    const pick = (v) => (v && !isBusy(v) && !v.error ? v : null);
+    // 内存里已拿到的结论（本次会话刚查过，最快）
+    const mem = pick(resultCache.get(k.full)) || pick(resultCache.get(k.lite));
+    if (mem) return mem;
+    // 再翻油猴存储（上一个页面 / 列表页那趟写的）
+    return pick(cacheGet(k.storeFull, ttl)) || pick(cacheGet(k.storeLite, ttl));
+  }
+
+  /**
+   * @param {boolean} [lite] true = 列表页的浅查询（只要在不在库里）
+   *
+   * 缓存优先级：lite 请求可以先吃 full 的结论（full 是超集）；
+   * full 请求绝不能吃 lite 的结论（会缺画质/分集），否则详情页面板永远补不全。
+   */
+  async function checkTorrentCached(rawTitle, imdb, priority, lite) {
+    const k = cacheKeysOf(rawTitle, imdb);
     // 有 IMDb 时以 IMDb 为主键：同一部片子不同压制版本可共用一次查询结果
-    const key = `mp|${imdb || ''}|${rawTitle}`;
-    const mem = checkCache.get(key);
+    const key = lite ? k.lite : k.full;
+    const mem = checkCache.get(key) || (lite ? checkCache.get(k.full) : null);
     if (mem) {
       const val = await mem;                      // 可能是 Promise，也可能已是结果
-      if (!isBusy(val)) return val;
+      if (!isBusy(val)) { resultCache.set(key, val); return val; }
       checkCache.delete(key);                     // 上次是排队超时，这次重查
     }
-    const storeKey = 'chk_' + hash(SCRIPT_VER + '|' + key);
-    const hit = cacheGet(storeKey, CONFIG.behavior.cacheHours * 3600e3);
-    if (hit && !isBusy(hit)) { checkCache.set(key, Promise.resolve(hit)); return hit; }
-    const p = checkLibrary(rawTitle, imdb, priority).then((r) => {
-      if (!isBusy(r)) cacheSet(storeKey, r);
+    const ttl = CONFIG.behavior.cacheHours * 3600e3;
+    if (lite) {
+      const full = cacheGet(k.storeFull, ttl);    // 打开过详情页的行，列表直接显示完整结论
+      if (full && !isBusy(full)) {
+        checkCache.set(key, Promise.resolve(full));
+        resultCache.set(key, full);
+        return full;
+      }
+    }
+    const storeKey = lite ? k.storeLite : k.storeFull;
+    const hit = cacheGet(storeKey, ttl);
+    if (hit && !isBusy(hit)) {
+      checkCache.set(key, Promise.resolve(hit));
+      resultCache.set(key, hit);
+      return hit;
+    }
+    const p = checkLibrary(rawTitle, imdb, priority, lite).then((r) => {
+      if (!isBusy(r)) {
+        cacheSet(storeKey, r);
+        resultCache.set(key, r);
+        // full 的结论比 lite 全，顺手把 lite 那份也升级掉，列表就不用再显示浅结论
+        if (!lite && r && r.found) {
+          cacheSet(k.storeLite, r);
+          if (resultCache.has(k.lite)) resultCache.set(k.lite, r);
+        }
+      }
       return r;
     })
       .catch((e) => ({ found: false, error: e.message }));
@@ -750,8 +812,9 @@
     return `<span class="ptmc-badge out" title="${esc(tip)}">未入库</span>`;
   }
 
-  /** 详情页面板 */
-  function panelHtml(r, rawTitle) {
+  /** 详情页面板
+   *  @param {boolean} [partial] 只用列表页已有结论铺的首屏，还在补全细节 */
+  function panelHtml(r, rawTitle, partial) {
     if (r && r.error) return `<div class="ptmc-panel"><div class="t">媒体库查询失败：${esc(r.error)}</div></div>`;
     if (!r) return `<div class="ptmc-panel"><div class="t">媒体库查询中…</div></div>`;
     if (isBusy(r)) {
@@ -809,7 +872,11 @@
       rows.push(['在库季集', `<span style="color:#374151">${esc(txt)}</span>`]);
     }
     if (q.path) rows.push(['路径', `<span style="color:#6b7280;word-break:break-all">${esc(q.path)}</span>`]);
-    return `<div class="ptmc-panel"><div class="t ${state}">媒体库检测</div><table>${rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table></div>`;
+    const hint = partial
+      ? '<div style="color:#6b7280;font-size:12px;margin:2px 0 4px">'
+        + '列表页已确认在库，正在补全画质 / 季集…</div>'
+      : '';
+    return `<div class="ptmc-panel"><div class="t ${state}">媒体库检测</div>${hint}<table>${rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('')}</table></div>`;
   }
 
   /* =====================================================================
@@ -839,7 +906,8 @@
   /** 列表行徽标填充：排队超时不算结论，隔一会儿自动重试（最多 busyRetries 次） */
   async function fillListBadge(holder, raw, imdb, attempt) {
     if (!holder.isConnected) return;               // 页面已刷新/行已移除
-    const r = await checkTorrentCached(raw, imdb, 'normal');
+    // 列表页只要「在不在库里」：lite 浅查询不会为画质/季集多打媒体服务器
+    const r = await checkTorrentCached(raw, imdb, 'normal', true);
     if (r && r.error) {
       warnOnce(r.error);
       holder.innerHTML = listFailHtml(r.error);
@@ -873,8 +941,11 @@
     const host = document.createElement('div');
     host.id = 'ptmc-detail';
     d.el.insertAdjacentElement('afterend', host);
-    host.innerHTML = panelHtml(null, d.title);
     const raw = d.subtitle ? `${d.title}\n${d.subtitle}` : d.title;
+    // 列表页那趟已经查过就先用它的结论铺上（不重新问、不重新识别），
+    // 然后才去补画质 / 季集 / 分集这些「打开了才需要」的信息
+    const known = peekCached(raw, d.imdb);
+    host.innerHTML = known ? panelHtml(known, raw, true) : panelHtml(null, raw);
     // 详情页是你正在看的那条：走 high 优先级，插件侧插队、页内也插队
     await fillDetailPanel(host, raw, d.imdb, 0);
   }
@@ -983,7 +1054,7 @@
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       collectNexusItems, collectTtgItems, splitByBr,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
-      checkLibrary, checkTorrentCached, mpKey, renderList, renderDetail,
+      checkLibrary, checkTorrentCached, cacheKeysOf, peekCached, mpKey, renderList, renderDetail,
       hostMatch, loadMpSites, siteExcluded,
       getMpSites: () => MP_SITES, setMpSites: (v) => { MP_SITES = v || []; },
     };

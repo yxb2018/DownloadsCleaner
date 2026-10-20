@@ -46,8 +46,8 @@
 | `userscripts/PT媒体库检测.user.js` | **主交付物**。瘦油猴客户端，只存 MP 地址 |
 | `plugins.v3/ptlibrarycheck/__init__.py` | MP 插件 `PtLibraryCheck` |
 | `package.v3.json` | 插件市场索引（key = 插件类名） |
-| `tests/test_mp_plugin.py` | 插件单测（201 项，MP 模块全打桩） |
-| `tests/test_userscript.js` | 瘦客户端单测（33 项） |
+| `tests/test_mp_plugin.py` | 插件单测（218 项，MP 模块全打桩） |
+| `tests/test_userscript.js` | 瘦客户端单测（37 项） |
 
 ---
 
@@ -113,7 +113,7 @@ Tampermonkey → 新建脚本 → 粘贴 `PT媒体库检测.user.js` 全文 → 
 ## 四、插件接口
 
 ```http
-GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&imdb=tt1234567][&season=1][&episode=9][&priority=high]
+GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&imdb=tt1234567][&season=1][&episode=9][&priority=high][&lite=1]
 ```
 
 **识别顺序（v1.1.0 起）**：`imdb` 优先 —— 站点种子行里如果已填 IMDb
@@ -234,6 +234,29 @@ GET /api/v1/plugin/PtLibraryCheck/sites
 `busy: true` 表示「没查到，不是没有」。油猴据此显示橙色「排队中」并自动重试
 （4s、8s，共 2 次），**不写缓存**，绝不会把排队超时记成「未入库」。
 
+### 两级查询：列表页只问「在不在」，详情页才要详情
+
+`lite=1` 是列表页用的浅查询 —— **只用搜索结果本身判断，不再为细节多打媒体服务器**：
+
+| | lite=1（列表页） | lite=0（详情页） |
+|---|---|---|
+| Emby 搜索 | 1 次 | 1 次 |
+| Emby 分集列表 / 分集画质 | 不查 | 查（剧集各 +1~2 次） |
+| Plex `/library/metadata/<id>` | 不查 | 查 |
+| Plex 季集 children | 不查 | 查 |
+| 返回字段 | `found/type/title/year/item_id` | 再加 `quality/seasons/episode/path` |
+| 剧集缺集提示 | 「库内」 | 「库内·缺 SxxExx」 |
+
+一条剧集列表行从最多 3 次媒体服务器请求降到 1 次。
+
+油猴的配合方式：
+
+- 列表页 `lite=1`；详情页 `lite=0`，且**先读列表页那趟的结论把面板铺上**
+  （`peekCached`，同步读本地缓存，不重新请求、不重新识别），再补全画质 / 季集。
+- 缓存按 `|full` / `|lite` 分开：lite 请求可以吃 full 的结论（超集），
+  **full 请求绝不吃 lite 的结论**（否则详情页永远补不全）。
+- full 成功后顺手把 lite 那份也升级掉，所以打开过一次详情页的行，回列表页直接显示完整结论（含缺集）。
+
 同题合并命中时返回体多一个 `coalesced: true`（表示结果来自别的标签页的同一次查询，
 不是自己那份数据的重新计算）。
 
@@ -312,13 +335,13 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 
 ```bash
 # MP 插件（把 MP 模块全打桩，不依赖真实 MP）
-python tests/test_mp_plugin.py          # 201 项
+python tests/test_mp_plugin.py          # 218 项
 
 # 油猴（Node 自带 test runner + jsdom）
-node tests/test_userscript.js           # 33 项
+node tests/test_userscript.js           # 37 项
 ```
 
-当前状态：**234 项全过**。
+当前状态：**255 项全过**。
 
 ---
 

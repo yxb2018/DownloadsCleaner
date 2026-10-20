@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.10"
+    plugin_version = "1.1.11"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -441,7 +441,8 @@ class PtLibraryCheck(_PluginBase):
                     episode: Optional[int] = None,
                     imdb: str = "",
                     debug: int = 0,
-                    priority: str = "normal") -> Dict[str, Any]:
+                    priority: str = "normal",
+                    lite: int = 0) -> Dict[str, Any]:
         """查询入口。阻塞的媒体服务器调用放到线程池，避免卡住事件循环。
 
         imdb 优先：站点种子页已填 IMDb 时传进来，识别更快也更准；
@@ -453,6 +454,10 @@ class PtLibraryCheck(_PluginBase):
         priority=high 走插队（详情页/手动刷新），normal 排队（列表页批量）。
         同一标题同时被多个标签页查询时只算一次（single-flight），
         重复的请求直接等结果，不再压媒体服务器。
+
+        lite=1 是「列表页只需要知道在不在库里」的浅查询：只用搜索结果本身判断，
+        不再为画质/音轨/季集分集额外发请求（Plex 不拉 metadata、Emby 不拉分集列表）。
+        详情页打开时用 lite=0 拿全量，两者缓存分开，互不覆盖。
         """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
@@ -463,12 +468,15 @@ class PtLibraryCheck(_PluginBase):
             return {"success": False, "message": "缺少 title 或 imdb 参数"}
 
         is_debug = bool(debug)
+        is_lite = bool(lite)
         prio = self._gate.HIGH if str(priority).lower() in ("high", "hot", "1") else self._gate.NORMAL
-        # 同题合并：debug 请求要真实数据，不参与合并
+        # 同题合并：debug 请求要真实数据，不参与合并。
+        # lite 与 full 是两个不同的活儿（full 要多打几次媒体服务器），不能合并
         sig = ""
         if not is_debug:
             sig = hashlib.md5(
-                f"{imdb}|{title}\n{subtitle}|{season}|{episode}".encode("utf-8")
+                f"{imdb}|{title}\n{subtitle}|{season}|{episode}|{'L' if is_lite else 'F'}"
+                .encode("utf-8")
             ).hexdigest()[:16]
             owner, event = self._join_flight(sig)
             if not owner:
@@ -491,7 +499,7 @@ class PtLibraryCheck(_PluginBase):
                 }}
             try:
                 data = await asyncio.to_thread(
-                    self._query, title, subtitle, season, episode, imdb, is_debug,
+                    self._query, title, subtitle, season, episode, imdb, is_debug, is_lite,
                 )
             finally:
                 self._gate.release()
@@ -548,11 +556,12 @@ class PtLibraryCheck(_PluginBase):
     # ------------------------------------------------------------------
     def _query(self, title: str, subtitle: str,
                want_season: Optional[int], want_episode: Optional[int],
-               imdb: str = "", debug: bool = False) -> Dict[str, Any]:
+               imdb: str = "", debug: bool = False, lite: bool = False) -> Dict[str, Any]:
         # 缓存（debug 请求一定要看真实耗时，不读缓存）
         cache_key = None
         if self._cache_hours > 0 and not debug:
-            raw = f"{imdb}|{title}\n{subtitle}|{want_season}|{want_episode}"
+            # lite 与 full 的缓存分开：lite 少了画质/分集，拿去当 full 用会缺字段
+            raw = f"{imdb}|{title}\n{subtitle}|{want_season}|{want_episode}|{'L' if lite else 'F'}"
             # 版本号并入 key：判定逻辑一改，旧版本写下的结论就必须失效，
             # 否则升级后页面还在用上一版的（错误）判断。
             # 用 md5 而不是内置 hash()：后者按进程随机加盐，重启后缓存全废。
@@ -564,7 +573,7 @@ class PtLibraryCheck(_PluginBase):
                     return hit["v"]
 
         result = self._query_uncached(title, subtitle, want_season, want_episode,
-                                      imdb, debug)
+                                      imdb, debug, lite)
 
         # 超时的结果不写缓存，下次还会重试
         if cache_key and not result.get("timeout"):
@@ -576,7 +585,8 @@ class PtLibraryCheck(_PluginBase):
 
     def _query_uncached(self, title: str, subtitle: str,
                         want_season: Optional[int], want_episode: Optional[int],
-                        imdb: str = "", debug: bool = False) -> Dict[str, Any]:
+                        imdb: str = "", debug: bool = False,
+                        lite: bool = False) -> Dict[str, Any]:
         """查询主流程。
 
         设计原则（性能即功能）：反代 30s 断流，超时就是「没有状态」，
@@ -694,7 +704,7 @@ class PtLibraryCheck(_PluginBase):
                 })
             if best and best[1] >= 95:
                 hit = self._hit_result(name, stype, server, best[0], is_tv,
-                                       season, episode, imdb, None)
+                                       season, episode, imdb, None, lite=lite)
                 if hit:
                     return _done(hit)
             # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
@@ -783,7 +793,7 @@ class PtLibraryCheck(_PluginBase):
                     suspect = best
                 continue
             hit = self._hit_result(name, stype, server, best[0], is_tv,
-                                   season, episode, imdb, matched_by)
+                                   season, episode, imdb, matched_by, lite=lite)
             if hit:
                 return _done(hit)
 
@@ -823,13 +833,17 @@ class PtLibraryCheck(_PluginBase):
 
     def _hit_result(self, name: str, stype: str, server: Any, best: dict,
                     is_tv: bool, season: Optional[int], episode: Optional[int],
-                    imdb: str, matched_by: Optional[str]) -> Optional[Dict[str, Any]]:
+                    imdb: str, matched_by: Optional[str],
+                    lite: bool = False) -> Optional[Dict[str, Any]]:
         if stype == "plex":
-            hit = self._finish_plex(server, best, is_tv, season, episode)
+            hit = self._finish_plex(server, best, is_tv, season, episode, lite=lite)
         else:
-            hit = self._finish_emby(server, best, is_tv, season, episode)
+            hit = self._finish_emby(server, best, is_tv, season, episode, lite=lite)
         if not hit:
             return None
+        if lite:
+            # 浅查询：只有「在不在库里」这个结论，画质/分集留给详情页
+            hit["lite"] = True
         hit["server"] = name
         hit["server_type"] = stype
         if imdb:
@@ -1031,17 +1045,20 @@ class PtLibraryCheck(_PluginBase):
         return items
 
     def _finish_emby(self, server: Any, best: dict, is_tv: bool,
-                     season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
+                     season: Optional[int], episode: Optional[int],
+                     lite: bool = False) -> Optional[Dict[str, Any]]:
         out: Dict[str, Any] = {
             "found": True,
             "type": "tv" if is_tv else "movie",
             "title": best.get("Name") or "",
             "year": best.get("ProductionYear"),
             "item_id": best.get("Id"),
+            # 搜索返回的条目里就带 Media/Stream，解析它是纯本地计算，不额外发请求
             "quality": self._emby_quality(best),
         }
 
-        if not is_tv:
+        # 浅查询到这里就够：在库 + 片名/年份。季集与分集画质要再打媒体服务器，留给详情页
+        if lite or not is_tv:
             return out
 
         # 剧集：列出在库季集
@@ -1149,7 +1166,8 @@ class PtLibraryCheck(_PluginBase):
         return candidates
 
     def _finish_plex(self, server: Any, best: dict, is_tv: bool,
-                     season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
+                     season: Optional[int], episode: Optional[int],
+                     lite: bool = False) -> Optional[Dict[str, Any]]:
         rk = best.get("ratingKey")
         out: Dict[str, Any] = {
             "found": True,
@@ -1158,6 +1176,9 @@ class PtLibraryCheck(_PluginBase):
             "year": best.get("year"),
             "item_id": rk,
         }
+        # Plex 的画质要再拉一次 /library/metadata/<id>，浅查询直接跳过
+        if lite:
+            return out
         detail = self._plex_metadata(server, rk)
         if detail:
             out["quality"] = self._plex_quality(detail)
