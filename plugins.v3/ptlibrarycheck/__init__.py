@@ -1,20 +1,22 @@
 """PT 媒体库检测插件。
 
-给 PT 站点的油猴脚本提供一个查询接口：传入种子标题，返回该资源是否已在
-MP 配置的媒体服务器（Emby / Plex / Jellyfin ...）中，以及在库版本的
-分辨率 / 杜比视界 / HDR / 编码 / 音轨 / 字幕 / 路径。
+给 PT 站点的油猴脚本提供一个查询接口：传入种子标题（或站点已填的 IMDb ID），
+返回该资源是否已在 MP 配置的媒体服务器（Emby / Plex / Jellyfin ...）中，以及
+在库版本的分辨率 / 杜比视界 / HDR / 编码 / 音轨 / 字幕 / 路径。
 
 设计要点：
 - 插件复用 MP 已配置的媒体服务器凭据，**不在任何地方保存 Emby/Plex 密钥**；
-- 标题识别直接用 MP 的 MetaInfo 工厂 + MediaChain.recognize_by_meta，
-  与订阅 / 媒体整理用的是同一套解析与 TMDB 识别；
+- 识别优先用 imdb 参数（站点种子页已填的 IMDb ID 直接拿得到，最准也最快），
+  没有 imdb 才退回 MetaInfo 工厂 + MediaChain 标题识别；
+- Emby/Jellyfin 有 imdb 时用 AnyProviderIdEquals 直查条目，省掉按片名搜索；
+  Plex 用 imdb 给候选加权（guid 里带 imdb://tt... 的直接命中）；
 - 画质信息通过媒体服务器模块自带的 get_data() 取原始 JSON 解析，
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
 """
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from app.application.mediaserver import MediaServerHelper
@@ -23,10 +25,25 @@ from app.domain.metainfo import MetaInfo
 from app.schemas.types import MediaType
 from app.sdk.plugin import _PluginBase
 
+try:  # MediaSource 是 MP v3 才有的枚举，缺失时自动降级为标题识别
+    from app.schemas.types import MediaSource
+except Exception:  # noqa: BLE001
+    MediaSource = None  # type: ignore[assignment]
+
 # 查询结果缓存 key 前缀
 _CACHE_PREFIX = "ptmc_chk_"
 # 单次查询最多返回的在库季集数量（避免响应体过大）
 _MAX_SEASONS = 20
+# IMDb ID：tt + 6~10 位数字
+_IMDB_RE = re.compile(r"(tt\d{6,10})", re.I)
+
+
+def _normalize_imdb(value: Any) -> str:
+    """把站点上各种写法（完整 URL / 带空格 / 纯 tt1234567）统一成 tt1234567。"""
+    if not value:
+        return ""
+    m = _IMDB_RE.search(str(value))
+    return m.group(1).lower() if m else ""
 
 
 class PtLibraryCheck(_PluginBase):
@@ -34,7 +51,7 @@ class PtLibraryCheck(_PluginBase):
 
     plugin_name = "PT媒体库检测"
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询（复用 MP 已配置的媒体服务器）"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "local"
     plugin_label = "媒体库"
     plugin_order = 100
@@ -140,7 +157,8 @@ class PtLibraryCheck(_PluginBase):
                 "auth": "apikey",
                 "allow_anonymous": self._allow_anonymous,
                 "summary": "查询媒体库是否存在该资源",
-                "description": "传入种子标题（可带副标题），返回存在性、在库版本画质与分集情况",
+                "description": "传入种子标题（可带副标题）或 imdb=tt1234567，"
+                               "返回存在性、在库版本画质与分集情况",
             }
         ]
 
@@ -148,17 +166,23 @@ class PtLibraryCheck(_PluginBase):
                     title: str = "",
                     subtitle: str = "",
                     season: Optional[int] = None,
-                    episode: Optional[int] = None) -> Dict[str, Any]:
-        """查询入口。阻塞的媒体服务器调用放到线程池，避免卡住事件循环。"""
+                    episode: Optional[int] = None,
+                    imdb: str = "") -> Dict[str, Any]:
+        """查询入口。阻塞的媒体服务器调用放到线程池，避免卡住事件循环。
+
+        imdb 优先：站点种子页已填 IMDb 时传进来，识别更快也更准；
+        没有才用 title + subtitle 解析。
+        """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         title = (title or "").strip()
-        if not title:
-            return {"success": False, "message": "缺少 title 参数"}
+        imdb = _normalize_imdb(imdb)
+        if not title and not imdb:
+            return {"success": False, "message": "缺少 title 或 imdb 参数"}
         import asyncio
         try:
             data = await asyncio.to_thread(
-                self._query, title, (subtitle or "").strip(), season, episode
+                self._query, title, (subtitle or "").strip(), season, episode, imdb
             )
         except Exception as err:  # noqa: BLE001 - 接口不能把异常抛给前端
             return {"success": False, "message": f"查询失败：{err}"}
@@ -168,18 +192,19 @@ class PtLibraryCheck(_PluginBase):
     # 查询主流程
     # ------------------------------------------------------------------
     def _query(self, title: str, subtitle: str,
-               want_season: Optional[int], want_episode: Optional[int]) -> Dict[str, Any]:
+               want_season: Optional[int], want_episode: Optional[int],
+               imdb: str = "") -> Dict[str, Any]:
         # 缓存
         cache_key = None
         if self._cache_hours > 0:
-            raw = f"{title}\n{subtitle}|{want_season}|{want_episode}"
+            raw = f"{imdb}|{title}\n{subtitle}|{want_season}|{want_episode}"
             cache_key = _CACHE_PREFIX + str(abs(hash(raw)))
             hit = self.get_data(cache_key)
             if isinstance(hit, dict) and hit.get("_t"):
                 if time.time() - hit["_t"] < self._cache_hours * 3600:
                     return hit["v"]
 
-        result = self._query_uncached(title, subtitle, want_season, want_episode)
+        result = self._query_uncached(title, subtitle, want_season, want_episode, imdb)
 
         if cache_key:
             try:
@@ -189,24 +214,33 @@ class PtLibraryCheck(_PluginBase):
         return result
 
     def _query_uncached(self, title: str, subtitle: str,
-                        want_season: Optional[int], want_episode: Optional[int]) -> Dict[str, Any]:
+                        want_season: Optional[int], want_episode: Optional[int],
+                        imdb: str = "") -> Dict[str, Any]:
         # 1. 标题解析（MP 原生 MetaInfo 工厂，返回 MetaVideo/MetaAnime/MetaMusic）
-        meta = MetaInfo(title, subtitle or None)
-        is_tv = meta.type == MediaType.TV or bool(meta.begin_season)
-        season = want_season if want_season is not None else meta.begin_season
-        episode = want_episode if want_episode is not None else meta.begin_episode
+        #    即便有 imdb 也要解析：季集号写在标题里，imdb 不带季集信息
+        #    只给 imdb 不给标题时跳过解析
+        meta = MetaInfo(title, subtitle or None) if title else None
+        is_tv = bool(meta) and (meta.type == MediaType.TV or bool(meta.begin_season))
+        if want_season is not None:
+            season = want_season
+        else:
+            season = getattr(meta, "begin_season", None)
+        if want_episode is not None:
+            episode = want_episode
+        else:
+            episode = getattr(meta, "begin_episode", None)
 
-        # 2. TMDB 识别（拿不到就用名称+年份匹配）
+        # 2. 识别：imdb 直查优先，拿不到才退回标题识别
         tmdb_id = None
-        try:
-            mediainfo = MediaChain().recognize_by_meta(meta)
-            if mediainfo and mediainfo.tmdb_id:
+        matched_by = None
+        mediainfo = self._recognize(meta, is_tv, imdb)
+        if mediainfo is not None:
+            matched_by = "imdb" if imdb else "title"
+            if getattr(mediainfo, "tmdb_id", None):
                 tmdb_id = str(mediainfo.tmdb_id)
-        except Exception as err:  # noqa: BLE001 - 识别失败不该阻断查询
-            self._log(f"TMDB 识别失败：{err}")
 
-        names = self._candidate_names(meta)
-        if not names:
+        names = self._candidate_names(meta) if meta is not None else []
+        if not names and not imdb:
             return {"found": False, "reason": "无法解析片名", "title": title}
 
         # 3. 遍历 MP 里配置的所有媒体服务器
@@ -216,6 +250,7 @@ class PtLibraryCheck(_PluginBase):
             return {"found": False, "reason": "MP 未配置媒体服务器", "title": title}
 
         errors: List[str] = []
+        year = getattr(meta, "year", None)
         for name, svc in services.items():
             server = svc.instance
             # MediaServerConf.type 当前是 str；兼容未来改成 Enum 的情况
@@ -225,11 +260,11 @@ class PtLibraryCheck(_PluginBase):
                 continue
             try:
                 if stype in ("emby", "jellyfin"):
-                    hit = self._check_emby(server, names, meta.year, tmdb_id,
-                                           is_tv, season, episode)
+                    hit = self._check_emby(server, names, year, tmdb_id,
+                                           is_tv, season, episode, imdb)
                 elif stype == "plex":
-                    hit = self._check_plex(server, names, meta.year, tmdb_id,
-                                           is_tv, season, episode)
+                    hit = self._check_plex(server, names, year, tmdb_id,
+                                           is_tv, season, episode, imdb)
                 else:
                     continue
             except Exception as err:  # noqa: BLE001 - 单个服务器失败不影响其他
@@ -238,28 +273,97 @@ class PtLibraryCheck(_PluginBase):
             if hit:
                 hit["server"] = name
                 hit["server_type"] = stype
+                if imdb:
+                    hit["imdb"] = imdb
+                if matched_by:
+                    hit["matched_by"] = matched_by
                 return hit
 
         reason = "媒体库无此资源"
         if errors:
             reason += "（" + "；".join(errors[:2]) + "）"
-        return {"found": False, "reason": reason, "title": title}
+        out = {"found": False, "reason": reason, "title": title}
+        if imdb:
+            out["imdb"] = imdb
+        return out
+
+    # ------------------------------------------------------------------
+    # 识别
+    # ------------------------------------------------------------------
+    def _recognize(self, meta: Any, is_tv: bool, imdb: str) -> Any:
+        """优先用 IMDb 直查媒体信息，失败再退回标题识别。
+
+        MP 各版本识别签名差异较大：
+          v3.1.x → recognize_media(media_source=MediaSource.IMDb, media_id=..)
+          更早   → recognize_media(meta=..) / recognize_by_meta(meta)
+        全部 try 一遍，能拿到就用；拿不到不阻断查询（还有按名搜索兜底）。
+        """
+        chain = MediaChain()
+        mtype = MediaType.TV if is_tv else MediaType.MOVIE
+
+        if imdb and MediaSource is not None:
+            for source in (MediaSource.IMDb, "imdb"):
+                fn = getattr(chain, "recognize_media", None)
+                if not fn:
+                    break
+                try:
+                    info = fn(media_source=source, media_id=imdb, mtype=mtype)
+                    if info:
+                        return info
+                except Exception as err:  # noqa: BLE001
+                    self._log(f"IMDb 识别失败（{source}）：{err}")
+
+        for fn_name, kwargs in (
+            ("recognize_media", {"meta": meta, "mtype": mtype}),
+            ("recognize_by_meta", {"meta": meta}),
+        ):
+            fn = getattr(chain, fn_name, None)
+            if not fn or meta is None:
+                continue
+            try:
+                info = fn(**kwargs)
+                if info:
+                    return info
+            except Exception as err:  # noqa: BLE001 - 识别失败不该阻断查询
+                self._log(f"{fn_name} 识别失败：{err}")
+        return None
 
     # ------------------------------------------------------------------
     # Emby / Jellyfin
     # ------------------------------------------------------------------
     def _check_emby(self, server: Any, names: List[str], year: Optional[str],
                     tmdb_id: Optional[str], is_tv: bool,
-                    season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
+                    season: Optional[int], episode: Optional[int],
+                    imdb: str = "") -> Optional[Dict[str, Any]]:
         item_type = "Series" if is_tv else "Movie"
+        fields = ("Fields=MediaSources,MediaStreams,ProviderIds,ProductionYear,"
+                  "OriginalTitle,Path")
         items: List[dict] = []
         seen = set()
-        for term in names[:3]:
+
+        # IMDb 直查：Emby / Jellyfin 的 AnyProviderIdEquals=imdb.tt1234567
+        # 一次就能定位条目，省掉按片名搜索 + 名称模糊比对
+        if imdb:
+            url = (
+                f"[HOST]emby/Items?Recursive=true&IncludeItemTypes={item_type}"
+                f"&AnyProviderIdEquals=imdb.{imdb}&Limit=5&{fields}&api_key=[APIKEY]"
+            )
+            try:
+                res = server.get_data(url)
+            except Exception as err:  # noqa: BLE001 - 直查失败退回名称搜索
+                self._log(f"Emby IMDb 直查失败：{err}")
+                res = None
+            if res:
+                for it in (res.json() or {}).get("Items") or []:
+                    if it.get("Id") and it["Id"] not in seen:
+                        seen.add(it["Id"])
+                        items.append(it)
+
+        for term in (names[:3] if not items else []):
             url = (
                 f"[HOST]emby/Items?Recursive=true&IncludeItemTypes={item_type}"
                 f"&searchTerm={quote(term)}&Limit=20"
-                f"&Fields=MediaSources,MediaStreams,ProviderIds,ProductionYear,"
-                f"OriginalTitle,Path&api_key=[APIKEY]"
+                f"&{fields}&api_key=[APIKEY]"
             )
             res = server.get_data(url)
             if not res:
@@ -279,9 +383,7 @@ class PtLibraryCheck(_PluginBase):
                     continue
                 url = (
                     f"[HOST]emby/Items?Recursive=true&IncludeItemTypes=Series"
-                    f"&searchTerm={quote(bare)}&Limit=20"
-                    f"&Fields=MediaSources,MediaStreams,ProviderIds,ProductionYear,"
-                    f"OriginalTitle,Path&api_key=[APIKEY]"
+                    f"&searchTerm={quote(bare)}&Limit=20&{fields}&api_key=[APIKEY]"
                 )
                 res = server.get_data(url)
                 if not res:
@@ -293,7 +395,7 @@ class PtLibraryCheck(_PluginBase):
                 if items:
                     break
 
-        best = self._pick_best(items, names, year, tmdb_id, emby=True)
+        best = self._pick_best(items, names, year, tmdb_id, emby=True, imdb=imdb)
         if not best:
             return None
 
@@ -378,7 +480,8 @@ class PtLibraryCheck(_PluginBase):
     # ------------------------------------------------------------------
     def _check_plex(self, server: Any, names: List[str], year: Optional[str],
                     tmdb_id: Optional[str], is_tv: bool,
-                    season: Optional[int], episode: Optional[int]) -> Optional[Dict[str, Any]]:
+                    season: Optional[int], episode: Optional[int],
+                    imdb: str = "") -> Optional[Dict[str, Any]]:
         mtype = 2 if is_tv else 1
         candidates: List[dict] = []
         seen = set()
@@ -402,7 +505,7 @@ class PtLibraryCheck(_PluginBase):
             if candidates:
                 break
 
-        best = self._pick_best(candidates, names, year, tmdb_id, emby=False)
+        best = self._pick_best(candidates, names, year, tmdb_id, emby=False, imdb=imdb)
         if not best:
             return None
 
@@ -593,8 +696,28 @@ class PtLibraryCheck(_PluginBase):
                 best = max(best, 70)
         return best
 
+    @staticmethod
+    def _item_imdb(item: dict, emby: bool) -> str:
+        """从 Emby/Plex 的条目里取 IMDb ID。"""
+        if emby:
+            ids = item.get("ProviderIds") or {}
+            for key, value in ids.items():
+                if str(key).lower() == "imdb" and value:
+                    return _normalize_imdb(value)
+            return ""
+        guid = str(item.get("guid") or "")
+        found = _normalize_imdb(guid)
+        if found:
+            return found
+        for g in item.get("Guid") or []:
+            found = _normalize_imdb((g or {}).get("id") if isinstance(g, dict) else g)
+            if found:
+                return found
+        return ""
+
     def _pick_best(self, items: List[dict], names: List[str], year: Optional[str],
-                   tmdb_id: Optional[str], emby: bool) -> Optional[dict]:
+                   tmdb_id: Optional[str], emby: bool,
+                   imdb: str = "") -> Optional[dict]:
         if not items:
             return None
         scored = []
@@ -610,6 +733,9 @@ class PtLibraryCheck(_PluginBase):
                 m = re.search(r"tmdb://(\d+)", guid)
                 cand_tmdb = m.group(1) if m else None
             score = self._name_score(cand_name, names)
+            if imdb and self._item_imdb(it, emby) == imdb:
+                # IMDb 是硬身份：命中就不再看片名像不像
+                score += 400
             if tmdb_id and cand_tmdb and str(cand_tmdb) == str(tmdb_id):
                 score += 200
             if score <= 0:
@@ -626,6 +752,11 @@ class PtLibraryCheck(_PluginBase):
     # ------------------------------------------------------------------
     # 工具
     # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_imdb(value: Any) -> str:
+        """把站点上的各种写法统一成 tt1234567（供外部/测试直接调用）。"""
+        return _normalize_imdb(value)
+
     @staticmethod
     def _log(message: str) -> None:
         try:

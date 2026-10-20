@@ -19,13 +19,14 @@
   },
   "PtLibraryCheck": {
     "name": "PT媒体库检测",
-    "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥。",
+    "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.0": "识别优先用 IMDb：新增 imdb 参数（tt1234567，兼容完整 IMDb 链接），有 imdb 时先走 MediaChain 的 IMDb 身份识别，Emby/Jellyfin 直接用 AnyProviderIdEquals=imdb.ttXXXX 定条目、省掉按片名搜索，Plex 用 imdb 给候选加权；没有 imdb 才退回标题识别。返回值新增 imdb / matched_by 便于前端展示识别方式。",
       "v1.0.0": "初始版本：/check 接口支持电影/剧集存在性、在库版本画质（分辨率/杜比视界/HDR/编码/音轨/字幕/路径）与分集在库情况"
     }
   }
