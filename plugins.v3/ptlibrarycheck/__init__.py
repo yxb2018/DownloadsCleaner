@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.17"
+    plugin_version = "1.1.18"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -891,6 +891,55 @@ class PtLibraryCheck(_PluginBase):
                     seen.add(key)
                     merged.append(it)
                 collected[idx] = (name, svc, server, stype, merged)
+
+        # 3.2 补搜后仍有服务器 0 候选：多半是库内主名是中文，而带 imdb 的识别
+        # 走 IMDb 源只给英文/原语言片名（实测《华颐》：Emby 第二轮靠别名命中，
+        # Plex 拿英文名照样 0 候选）。改走标题识别拿中文名，再对空的服务器补搜。
+        if (imdb and meta is not None
+                and any(not t[4] for t in collected)
+                and time.time() < deadline):
+            remain4 = deadline - time.time()
+            info4, timed_out4, cost4 = self._recognize_bounded(
+                meta, is_tv, "",
+                timeout=min(float(self._budget("recognize_timeout", 6)), remain4),
+            )
+            if dbg is not None:
+                dbg["recognize_for_sources"] = {
+                    "mode": "title",
+                    "cost": round(cost4, 2), "timed_out": timed_out4,
+                    "ok": info4 is not None,
+                }
+            if info4 is not None:
+                tid4, _recog4, extra4 = self._absorb_recognized(info4, names)
+                if tid4 and not tmdb_id:
+                    tmdb_id = tid4
+                if extra4:
+                    names = names + extra4
+                    for idx, (name2, svc2, server2, stype2, items2) in enumerate(list(collected)):
+                        if items2 or time.time() > deadline:
+                            continue
+                        try:
+                            more4 = (self._search_plex(server2, extra4, is_tv, imdb)
+                                     if stype2 == "plex"
+                                     else self._search_emby(server2, extra4, is_tv, imdb))
+                        except Exception as err:  # noqa: BLE001
+                            errors.append(f"{name2}: {err}")
+                            continue
+                        if dbg is not None:
+                            dbg.setdefault("backfill", []).append({
+                                "server": name2, "terms": list(extra4),
+                                "got": len(more4),
+                                "names": [str(it.get("title") or it.get("Name") or "")
+                                          for it in more4[:5]],
+                            })
+                        merged4, seen4 = [], set()
+                        for it3 in (items2 or []) + more4:
+                            k4 = it3.get("Id") or it3.get("ratingKey") or id(it3)
+                            if k4 in seen4:
+                                continue
+                            seen4.add(k4)
+                            merged4.append(it3)
+                        collected[idx] = (name2, svc2, server2, stype2, merged4)
 
         # 4. 第二轮判定：带上 tmdb_id / 全部片名重新评分
         suspect: Tuple[Any, int, bool] = (None, 0, False)
