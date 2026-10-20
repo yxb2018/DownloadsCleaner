@@ -75,7 +75,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -1056,6 +1056,8 @@ class PtLibraryCheck(_PluginBase):
             for word in _CN_TAG_WORDS:
                 core = core.replace(word, " ")
             core = re.sub(r"\s+", "", core)
+            # 「2026年亚残运会开幕式」会在数字处断开，留下「年亚残运会开幕式」这种残片
+            core = re.sub(r"^[年月日号期集话話]", "", core)
             if len(core) < 2 or len(core) > 30:
                 continue
             if not re.search(r"[\u3400-\u9fff]", core):
