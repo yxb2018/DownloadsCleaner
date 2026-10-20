@@ -47,7 +47,7 @@
 | `plugins.v3/ptlibrarycheck/__init__.py` | MP 插件 `PtLibraryCheck` |
 | `package.v3.json` | 插件市场索引（key = 插件类名） |
 | `tests/test_mp_plugin.py` | 插件单测（173 项，MP 模块全打桩） |
-| `tests/test_userscript.js` | 瘦客户端单测（25 项） |
+| `tests/test_userscript.js` | 瘦客户端单测（27 项） |
 
 ---
 
@@ -215,7 +215,7 @@ GET /api/v1/plugin/PtLibraryCheck/sites
 | 我堡 OurBits | `ourbits.club` |
 | 观众 Audiences | `audiences.me` |
 | 憨憨 HHanClub | `hhanclub.net` / `hhanclub.top` |
-| 听听歌 TTG | `totheglory.im` |
+| 听听歌 TTG | `totheglory.im`（结构特殊：标题链接 `/t/<id>/`，见下） |
 
 **域名以 MP 站点表为准**：脚本启动时调插件 `GET /api/v1/plugin/PtLibraryCheck/sites`，
 按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空）取出对应域名。
@@ -237,6 +237,18 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 热度角标（`.hot`）与编码圈（`.circle`）会在取副标题前剔掉，否则「官方」「独占」
 会被当成片名候选。个别站徽标位置不对时，调 `collectListItems()` 里的选择器即可。
 
+**听听歌 TTG 是例外**，它和 NexusPHP 通用结构完全不同：
+
+| | NexusPHP 通用 | TTG |
+|---|---|---|
+| 种子 id | 标题链接 `details.php?id=123` 的 query | `<tr id="838510">` 的行 id |
+| 标题链接 | `details.php?id=123&hit=1` | **`/t/838510/`**（`details.php` 的链接全是 filelist/做种/下载/评论计数） |
+| 中文名 | 独立副标题元素（`font.subtitle` 等） | 与发布名同在 `<b>` 里，用 `<br>` 分隔 |
+| IMDb | `a[href*="imdb.com/title/tt"]` | 同左（`.name_right` 的 `imdb_rate`） |
+
+所以 `collectListItems()` 按站点分派：TTG 走 `collectTtgItems()`（按 `<tr id>` 取行、
+`splitByBr()` 切标题/中文名、徽标插在 `<b>` 之后避免继承加粗），其余走 `collectNexusItems()`。
+
 ---
 
 ## 七、测试
@@ -246,10 +258,10 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 python tests/test_mp_plugin.py          # 173 项
 
 # 油猴（Node 自带 test runner + jsdom）
-node tests/test_userscript.js           # 25 项
+node tests/test_userscript.js           # 27 项
 ```
 
-当前状态：**198 项全过**。
+当前状态：**200 项全过**。
 
 ---
 

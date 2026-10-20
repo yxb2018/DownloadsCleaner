@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.2.0
+// @version      2.2.1
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @match        *://*.audiences.me/*
@@ -28,13 +28,20 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.2.0）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.2.1）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.2.1
+ *   · 适配听听歌(TTG, totheglory.im)：它和 NexusPHP 通用结构不一样——
+ *     种子 id 在 <tr id="838510"> 上，标题链接是 /t/838510/ 而不是 details.php
+ *     （details.php 的链接全是 filelist/做种/下载/评论计数），标题与中文名
+ *     同在一个 <b> 里用 <br> 分隔。现在按站点分派采集器，徽标插在 <b> 之后，
+ *     不会被加粗。IMDb 仍取 .name_right 里的 imdb_rate 链接。
  *
  * v2.2.0
  *   · 只为**指定的几个站**打标，其它站点一律不跑：
@@ -198,7 +205,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.2.0';
+    return '2.2.1';
   })();
 
   // 限流队列：全局串行 + 最小间隔
@@ -494,8 +501,16 @@
     return pick(row.textContent);
   }
 
-  /** 列表页：找出所有种子行 [{id, row, link, title, subtitle, imdb}] */
+  /** 列表页：找出所有种子行 [{id, row, link, anchor, title, subtitle, imdb}]
+   *  按站点结构分派：NexusPHP 通用（标题链接是 details.php）与 TTG（标题链接是 /t/<id>/）。 */
   function collectListItems() {
+    const host = location.hostname;
+    if (hostMatch(host, 'totheglory.im')) return collectTtgItems();
+    return collectNexusItems();
+  }
+
+  /** NexusPHP 通用（HDSKY / 彩虹岛 / 春天 / 猫舍 / 观众 / 憨憨 …） */
+  function collectNexusItems() {
     const best = new Map();   // torrentId -> { a, title, score }
     document.querySelectorAll('a[href*="details.php"]').forEach((a) => {
       const id = torrentIdOf(a);
@@ -527,7 +542,69 @@
           .forEach((n) => n.remove());
         subtitle = clone.textContent.replace(/\s+/g, ' ').trim().slice(0, 300);
       }
-      out.push({ id, row, link: a, title, subtitle, imdb: imdbOfRow(row) });
+      out.push({ id, row, link: a, anchor: a, title, subtitle, imdb: imdbOfRow(row) });
+    });
+    return out;
+  }
+
+  /** 从元素里按 <br> 切成两段：前半是发布名，后半是中文名/字幕说明。
+   *  TTG 的标题是 <a href="/t/838510/"><b>Passenger 2026 …-DIY@TTG <br>
+   *  <span>鬼上车 / 乘吓(港) / 亡命旅人</span> *DIY 官译简繁粤中字</b></a>，
+   *  中英文混在同一个 <b> 里，靠 <br> 分隔。 */
+  function splitByBr(el) {
+    let head = '';
+    let tail = '';
+    let afterBr = false;
+    const walk = (node) => {
+      if (node.nodeType === 3) {
+        const t = String(node.nodeValue || '').replace(/\s+/g, ' ');
+        if (afterBr) tail += t; else head += t;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node.tagName === 'BR') { afterBr = true; return; }
+      for (let n = node.firstChild; n; n = n.nextSibling) walk(n);
+    };
+    for (let n = el.firstChild; n; n = n.nextSibling) walk(n);
+    return { head: head.trim(), tail: tail.trim() };
+  }
+
+  /** TTG（totheglory.im）：table#torrent_table，种子 id 在 <tr id="838510"> 上，
+   *  标题链接是 /t/<id>/，IMDb 在 .name_right 的 imdb_rate 里。 */
+  function collectTtgItems() {
+    const out = [];
+    const rows = document.querySelectorAll('#torrent_table tr[id]');
+    rows.forEach((row) => {
+      const id = String(row.id || '').trim();
+      if (!/^\d+$/.test(id)) return;                       // 表头/分组行没有数字 id
+      let link = null;
+      row.querySelectorAll('a[href]').forEach((a) => {
+        if (link) return;
+        const href = a.getAttribute('href') || '';
+        if (new RegExp('^/t/' + id + '/$|^/t/' + id + '$|\\.im/t/' + id + '/$').test(href)) link = a;
+      });
+      if (!link) {
+        // 兜底：任意 /t/<数字>/ 且带 <b> 的链接（标题一定加粗）
+        row.querySelectorAll('a[href*="/t/"]').forEach((a) => {
+          if (link) return;
+          if (/\/(\d+)\/?$/.test(a.getAttribute('href') || '') && a.querySelector('b')) link = a;
+        });
+      }
+      if (!link) return;
+      const box = link.querySelector('b') || link;
+      const { head, tail } = splitByBr(box);
+      const title = (head || (box.textContent || '')).replace(/\s+/g, ' ').trim();
+      if (title.length < 2) return;
+      out.push({
+        id,
+        row,
+        link,
+        // 徽标插在加粗标题之后（.name_left 内），别插进 <b> 里，免得继承加粗
+        anchor: box,
+        title,
+        subtitle: tail.slice(0, 300),
+        imdb: imdbOfRow(row),
+      });
     });
     return out;
   }
@@ -707,7 +784,9 @@
       const holder = document.createElement('span');
       holder.className = 'ptmc-holder';
       holder.innerHTML = listPendingHtml();
-      it.link.insertAdjacentElement('afterend', holder);
+      // anchor 是「徽标插在哪之后」：通用站就是标题链接；TTG 是标题所在的 <b>，
+      // 免得徽标被塞进 <b> 里继承加粗
+      (it.anchor || it.link).insertAdjacentElement('afterend', holder);
       // 标题行 + 副标题合并送检：片名取标题行，分辨率/季集等质量标签全文匹配
       const raw = it.subtitle ? `${it.title}\n${it.subtitle}` : it.title;
       const r = await checkTorrentCached(raw, it.imdb);
@@ -831,6 +910,7 @@
       CONFIG, BUILTIN_SITES, ADAPTED_SITE_NAMES, hash, badgeHtml, listPendingHtml, listFailHtml,
       panelHtml, tagsHtml,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
+      collectNexusItems, collectTtgItems, splitByBr,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, mpKey, renderList, renderDetail,
       hostMatch, loadMpSites, siteExcluded,
