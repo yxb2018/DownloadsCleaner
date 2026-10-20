@@ -69,6 +69,14 @@ class PtLibraryCheck(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
+    def get_page(self):
+        """无独立详情页，配置表单已够用。"""
+        return None
+
+    def stop_service(self) -> None:
+        """无后台服务需要停止。"""
+        return None
+
     # ------------------------------------------------------------------
     # 配置表单（MP 插件页直接渲染，无需前端构建）
     # ------------------------------------------------------------------
