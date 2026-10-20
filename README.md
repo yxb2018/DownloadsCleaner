@@ -103,6 +103,38 @@ MoviePilot V3 插件：**磁盘可用空间低于阈值时，自动清理下载�
 - qB 连接信息全部来自 MoviePilot 下载器配置，插件不存储任何凭据
 - V3 SDK：`app.sdk.plugin._PluginBase` / `app.sdk.services.DownloaderHelper` / `app.db.oper.transferhistory`
 
+## 本仓库的另一个插件：PT 媒体库检测（PtLibraryCheck）
+
+给 PT 站点油猴脚本提供查询接口：传入种子标题（或站点已填的 IMDb ID），返回该资源
+**是否已在 MP 配置的媒体服务器（Emby / Jellyfin / Plex）里**，以及在库版本的
+分辨率 / 杜比视界 / HDR / 编码 / 音轨 / 字幕 / 分集情况。
+
+### 安装
+
+1. 把本仓库加入 MoviePilot 插件市场（`PLUGIN_MARKET` 环境变量，多个仓库逗号分隔）：
+   `https://github.com/yxb2018/DownloadsCleaner`
+2. 在 WebUI 插件市场搜索「PT媒体库检测」并安装
+3. 油猴脚本侧：新建脚本粘贴脚本全文 → 菜单「① 设置 MP 地址与 API Key」
+
+### 接口
+
+```http
+GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&imdb=tt1234567][&season=1][&episode=9]
+```
+
+- `imdb` 优先：站点种子行里已填 IMDb 时直接传 `tt号`，识别更准更快；
+  Emby/Jellyfin 会用 `AnyProviderIdEquals=imdb.ttXXXX` 直接定条目，Plex 用 imdb 给候选加权
+- 只传 `imdb` 不传 `title` 时，Plex 无法按名搜索（会返回明确提示），Emby/Jellyfin 不受影响
+- 认证：插件配置里「允许匿名访问查询接口」打开则免密钥，关闭则请求头带 `X-API-KEY`
+
+### 说明
+
+- 复用 MP 已配置的媒体服务器凭据，**插件与油猴脚本都不保存 Emby/Plex 密钥**
+- 查询结果按标题+imdb 缓存（默认 24 小时，可在插件配置里改/关）
+- 插件代码：`plugins.v3/ptlibrarycheck/`，清单：`package.v3.json`
+- 配套油猴脚本：`userscripts/PT媒体库检测.user.js`（脚本内不含任何域名与密钥，
+  地址/Key 由油猴菜单录入并只存在 Tampermonkey 存储里），说明见 `userscripts/README.md`
+
 ## License
 
 MIT
