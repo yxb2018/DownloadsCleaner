@@ -165,7 +165,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.20"
+    plugin_version = "1.1.21"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -194,6 +194,13 @@ class PtLibraryCheck(_PluginBase):
     # 全局最多 2 条同时识别；等不到名额的查询立即放弃识别、按片名搜索结果
     # 兜底（放弃时 _recognize_bounded 返回 cost=-1，调用方不再排队重试）。
     _recog_sema = threading.BoundedSemaphore(2)
+    # 每台媒体服务器的搜索限流：实测 Emby 搜索在多并发下服务器端排队
+    # （NAS 性能有限，5 并发 miss 就从 1.2s 拖到 10s+），一台慢会占着闸门
+    # 名额拖住别的查询。每台最多 3 个并发搜索，等不到名额（8s）按「该服务器
+    # 查询失败」处理，别把整条查询拖过预算。
+    _srv_sema_lock = threading.Lock()
+    _srv_sema: Dict[str, threading.BoundedSemaphore] = {}
+    _srv_search_limit = 3
     # 查询专用线程池：check() 是 async，阻塞查询必须扔线程池。
     # 不用 asyncio.to_thread（走默认池，线程数 = min(32, CPU+4)，
     # NAS 上常常只有 12 个线程，闸门放行了也没线程干活）。
@@ -718,10 +725,7 @@ class PtLibraryCheck(_PluginBase):
                 continue
             t_srv = time.time()
             try:
-                if stype == "plex":
-                    items = self._search_plex(server, names, is_tv, imdb)
-                else:
-                    items = self._search_emby(server, names, is_tv, imdb)
+                items = self._search_server(name, stype, server, names, is_tv, imdb)
             except Exception as err:  # noqa: BLE001 - 单个服务器失败不影响其他
                 errors.append(f"{name}: {err}")
                 continue
@@ -798,10 +802,8 @@ class PtLibraryCheck(_PluginBase):
                         if time.time() > deadline:
                             break
                         try:
-                            if st2 == "plex":
-                                more = self._search_plex(srv2, recog_names, is_tv, imdb)
-                            else:
-                                more = self._search_emby(srv2, recog_names, is_tv, imdb)
+                            more = self._search_server(n2, st2, srv2, recog_names,
+                                                       is_tv, imdb)
                         except Exception as err:  # noqa: BLE001
                             errors.append(f"{n2}: {err}")
                             continue
@@ -896,10 +898,8 @@ class PtLibraryCheck(_PluginBase):
                 if time.time() > deadline:
                     break
                 try:
-                    if stype == "plex":
-                        more = self._search_plex(server, extra_names, is_tv, imdb)
-                    else:
-                        more = self._search_emby(server, extra_names, is_tv, imdb)
+                    more = self._search_server(name, stype, server, extra_names,
+                                               is_tv, imdb)
                 except Exception as err:  # noqa: BLE001
                     errors.append(f"{name}: {err}")
                     continue
@@ -939,9 +939,8 @@ class PtLibraryCheck(_PluginBase):
                         if items2 or time.time() > deadline:
                             continue
                         try:
-                            more4 = (self._search_plex(server2, extra4, is_tv, imdb)
-                                     if stype2 == "plex"
-                                     else self._search_emby(server2, extra4, is_tv, imdb))
+                            more4 = self._search_server(name2, stype2, server2,
+                                                        extra4, is_tv, imdb)
                         except Exception as err:  # noqa: BLE001
                             errors.append(f"{name2}: {err}")
                             continue
@@ -1244,6 +1243,27 @@ class PtLibraryCheck(_PluginBase):
             if PtLibraryCheck._informative(value) and value not in names and value not in extra:
                 extra.append(value)
         return tmdb_id, recog, extra
+
+    def _search_server(self, name: str, stype: str, server: Any,
+                       names: List[str], is_tv: bool, imdb: str) -> List[dict]:
+        """按服务器限流的搜索入口（主流程所有搜索都走这里）。
+
+        每台服务器最多 3 个并发搜索；等不到名额（8s）抛错，由调用方的
+        except 记到 errors 里继续，不拖垮整条查询。
+        """
+        with PtLibraryCheck._srv_sema_lock:
+            sema = PtLibraryCheck._srv_sema.get(name)
+            if sema is None:
+                sema = threading.BoundedSemaphore(self._srv_search_limit)
+                PtLibraryCheck._srv_sema[name] = sema
+        if not sema.acquire(timeout=8.0):
+            raise RuntimeError("服务器搜索排队超时（每台限 3 并发）")
+        try:
+            if stype == "plex":
+                return self._search_plex(server, names, is_tv, imdb)
+            return self._search_emby(server, names, is_tv, imdb)
+        finally:
+            sema.release()
 
     def _recognize_bounded(self, meta: Any, is_tv: bool, imdb: str,
                            timeout: float) -> Tuple[Any, bool, float]:
