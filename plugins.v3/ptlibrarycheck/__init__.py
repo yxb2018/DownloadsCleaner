@@ -207,7 +207,20 @@ class PtLibraryCheck(_PluginBase):
 
         names = self._candidate_names(meta)
         if not names:
-            return {"found": False, "reason": "无法解析片名", "title": title}
+            # 诊断版：dump meta 字段定位解析问题，定位后移除
+            debug = {
+                "meta_class": type(meta).__name__,
+                "mro": [c.__name__ for c in type(meta).__mro__[:4]],
+                "org_string": getattr(meta, "org_string", None),
+                "cn_name": getattr(meta, "cn_name", None),
+                "en_name": getattr(meta, "en_name", None),
+                "original_name": getattr(meta, "original_name", None),
+                "title": getattr(meta, "title", None),
+                "type": str(getattr(meta, "type", None)),
+                "year": getattr(meta, "year", None),
+                "subtitle": getattr(meta, "subtitle", None),
+            }
+            return {"found": False, "reason": "无法解析片名", "title": title, "debug": debug}
 
         # 3. 遍历 MP 里配置的所有媒体服务器
         helper = MediaServerHelper()
