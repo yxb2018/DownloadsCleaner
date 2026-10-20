@@ -1,29 +1,19 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.1.4
+// @version      2.2.0
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
-// @author       YaoXiaoBin
-// @match        *://*.ourbits.club/*
-// @match        *://*.pterclub.com/*
-// @match        *://*.hdarea.club/*
-// @match        *://*.mteam.cc/*
-// @match        *://*.hdsky.me/*
-// @match        *://*.chdbits.cid/*
-// @match        *://*.pthome.net/*
-// @match        *://*.soulvoice.club/*
-// @match        *://*.hdhome.org/*
-// @match        *://*.totheglory.im/*
-// @match        *://*.springsunday.net/*
-// @match        *://*.nicept.net/*
-// @match        *://*.hhanclub.top/*
-// @match        *://*.52pt.site/*
+// @author       yxb2018
 // @match        *://*.audiences.me/*
-// @match        *://*.hdatmos.club/*
-// @match        *://*.hdfans.org/*
-// @match        *://*.ubits.club/*
-// @match        *://*.pttime.org/*
-// @match        *://*.pt.keepfrds.com/*
+// @match        *://*.hdsky.me/*
+// @match        *://*.hhanclub.net/*
+// @match        *://*.hhanclub.top/*
+// @match        *://*.ourbits.club/*
+// @match        *://*.ptchdbits.co/*
+// @match        *://*.pterclub.com/*
+// @match        *://*.pterclub.net/*
+// @match        *://*.springsunday.net/*
+// @match        *://*.totheglory.im/*
 // @connect      *
 // 说明：MP 地址由用户在油猴菜单里自行填写，脚本不内置任何具体域名，
 //      因此这里只能用通配 @connect；如你不放心，可改成你自己的 MP 域名。
@@ -38,13 +28,25 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.1.2）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.2.0）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.2.0
+ *   · 只为**指定的几个站**打标，其它站点一律不跑：
+ *       天空(hdsky.me) 彩虹岛/岛(ptchdbits.co) 春天(springsunday.net)
+ *       猫站(pterclub.net/.com) 我堡(ourbits.club) 观众(audiences.me)
+ *       憨憨(hhanclub.net/.top) 听听歌/TTG(totheglory.im)
+ *   · 这几个站的**域名从 MP 站点表实时取**（插件 /sites 接口，按站点名匹配），
+ *     站点换域名（如 hhanclub.top → .net）只需在 MP 里改，脚本不用动；
+ *     拉不到时退回脚本内置的同名域名清单。
+ *   · 适配彩虹岛(CHDBits, ptchdbits.co)：副标题里的标签胶囊（.tag/官方/独占/
+ *     DIY/国语/中字/特效）、热度角标(.hot)、编码圈(.circle) 会被剔除，
+ *     避免「官方」「独占」被当成片名候选。
  *
  * v2.1.2
  *   · 列表页恢复「双向」状态：已入库标绿色「库内」，未入库标灰色「未入库」
@@ -58,7 +60,7 @@
  *
  * v2.1.0
  *   · 识别优先用站点已填的 IMDb：行内 icon-imdb 图标链接（如
- *     <a href="http://www.imdb.com/title/tt14205554"><img src="/pic/icon-imdb.png"></a>）
+ *     <a href="http://www.imdb.com/title/tt14205554"><img src="/icon-imdb.png"></a>）
  *     里的 tt 号直接作为标识传给插件，省掉片名解析与模糊比对；
  *     站点没填 IMDb 时才退回「主标题 + 副标题」识别。
  *
@@ -70,8 +72,7 @@
  *
  * 依赖：MP 已安装并启用 PtLibraryCheck 插件（plugins.v3/ptlibrarycheck）。
  *       接口：GET {mp.host}/api/v1/plugin/PtLibraryCheck/check?title=..&subtitle=..
- *
- * 旧版「直连 Emby/Plex」脚本保留为 PT媒体库检测-直连版.user.js，可作兜底。
+ *            GET {mp.host}/api/v1/plugin/PtLibraryCheck/sites
  * =====================================================================
  */
 
@@ -95,11 +96,16 @@
     },
     // 插件接口路径（改了插件类名才需要动这里）
     apiPath: '/api/v1/plugin/PtLibraryCheck/check',
+    // 站点清单接口：以 MP 站点表为准，站点换域名不用改本脚本
+    apiSitesPath: '/api/v1/plugin/PtLibraryCheck/sites',
 
-    // 站点过滤：extra 里填要额外启用的域名；exclude 里填要排除的（学校等优先于 extra）
+    // 站点过滤：只有「适配名单」里的站才打标
+    //   1) ADAPTED_SITE_NAMES 是 MP 里的站点名，脚本据此从 MP 站点表取域名；
+    //   2) CONFIG.sites.extra 可临时加域名（比如站点换域名但 MP 还没改）；
+    //   3) CONFIG.sites.exclude 优先级最高，可把名单里的站临时关掉。
     sites: {
       extra: [],       // 例：['pt.example.com']
-      exclude: [],     // 例：['byr.pt']（学校站）
+      exclude: [],     // 例：['hdsky.me']（临时不打标）
     },
 
     // 行为
@@ -117,14 +123,33 @@
     },
   };
 
-  // 内置站点名单（NexusPHP 系，不含学校站）。用户在 CONFIG.sites.extra/exclude 增删
-  const BUILTIN_SITES = [
-    'ourbits.club', 'pterclub.com', 'hdarea.club', 'mteam.cc', 'hdsky.me',
-    'chdbits.cid', 'pthome.net', 'soulvoice.club', 'hdhome.org',
-    'totheglory.im', 'springsunday.net', 'nicept.net', 'hhanclub.top',
-    '52pt.site', 'audiences.me', 'hdatmos.club', 'hdfans.org', 'ubits.club',
-    'pttime.org', 'keepfrds.com',
+  // 适配名单：MP 里的站点名 → 从 MP 站点表取出这些站的域名。
+  // 站点改域名时 MP 里一改就生效，脚本不用重装。
+  const ADAPTED_SITE_NAMES = [
+    '天空',             // HDSKY（已适配，作参照）
+    '彩虹岛',           // CHDBits / 岛
+    '春天',             // Spring Sunday
+    '猫站',             // PterClub
+    '我堡',             // OurBits
+    '观众',             // Audiences
+    '憨憨',             // HHanClub
+    '听听歌',           // TTG / ToTheGlory
   ];
+
+  // 内置域名（与 ADAPTED_SITE_NAMES 对应），MP 不可达时的兜底
+  const BUILTIN_SITES = [
+    'hdsky.me',
+    'ptchdbits.co',
+    'springsunday.net',
+    'pterclub.net', 'pterclub.com',
+    'ourbits.club',
+    'audiences.me',
+    'hhanclub.net', 'hhanclub.top',
+    'totheglory.im',
+  ];
+
+  // 从 MP 站点表里筛出来的适配站域名（loadMpSites 填充）；为空时只用 BUILTIN_SITES
+  let MP_SITES = [];
 
   /* =====================================================================
    * 二、基础设施
@@ -173,7 +198,7 @@
         return String(GM_info.script.version);
       }
     } catch (e) {}
-    return '2.1.4';
+    return '2.2.0';
   })();
 
   // 限流队列：全局串行 + 最小间隔
@@ -319,11 +344,72 @@
   /* =====================================================================
    * 四、站点适配（NexusPHP 通用）
    * ===================================================================== */
+  /** 域名后缀匹配：host 等于 d，或是以 .d 结尾（子域也算） */
+  function hostMatch(host, domain) {
+    const h = String(host || '').toLowerCase();
+    const d = String(domain || '').toLowerCase().trim().replace(/^\*?\.?/, '');
+    if (!h || !d) return false;
+    return h === d || h.endsWith('.' + d);
+  }
+
+  const SITES_TTL_MS = 12 * 3600e3;
+  let sitesPromise = null;
+
+  /** 从 MP 站点表取「适配名单」里那些站的域名（12 小时缓存，模块内也只请求一次）。
+   *  站点改名（hhanclub.top → .net）只需在 MP 里改，脚本不用重装。
+   *  只收 ADAPTED_SITE_NAMES 里的站，别的站一律不认。
+   *  失败不抛异常，静默退回 BUILTIN_SITES。 */
+  function loadMpSites(force) {
+    if (sitesPromise && !force) return sitesPromise;
+    sitesPromise = (async () => {
+      const cacheKey = 'sites_' + hash(SCRIPT_VER + '|sites2');
+      if (!force) {
+        const hit = cacheGet(cacheKey, SITES_TTL_MS);
+        if (Array.isArray(hit) && hit.length) { MP_SITES = hit; return MP_SITES; }
+      }
+      const host = mpHost();
+      if (!host) return MP_SITES;
+      try {
+        const headers = { Accept: 'application/json' };
+        const key = mpKey();
+        if (key) headers['X-API-KEY'] = key;
+        const data = await mpRequest(`${host}${CONFIG.apiSitesPath}`, headers);
+        const list = [];
+        const found = [];
+        ((data && data.sites) || []).forEach((s) => {
+          const name = String((s && s.name) || '').trim();
+          if (ADAPTED_SITE_NAMES.indexOf(name) < 0) return;   // 不在适配名单，跳过
+          if (found.indexOf(name) < 0) found.push(name);
+          (s.hosts || []).forEach((h) => {
+            const v = String(h || '').toLowerCase().trim();
+            if (v && list.indexOf(v) < 0) list.push(v);
+          });
+        });
+        if (list.length) {
+          MP_SITES = list;
+          cacheSet(cacheKey, list);
+        }
+        log(`MP 站点：适配 ${found.length}/${ADAPTED_SITE_NAMES.length} 个（${found.join('、')}），`
+          + `域名 ${list.join(' ')}`);
+      } catch (e) {
+        log('拉取 MP 站点清单失败，退回内置名单：' + e.message);
+      }
+      return MP_SITES;
+    })();
+    return sitesPromise;
+  }
+
+  function siteExcluded() {
+    return CONFIG.sites.exclude.some((d) => hostMatch(location.hostname, d));
+  }
+
   function siteAllowed() {
     const host = location.hostname;
-    if (CONFIG.sites.exclude.some((d) => host.includes(d))) return false;
-    if (CONFIG.sites.extra.some((d) => host.includes(d))) return true;
-    if (BUILTIN_SITES.some((d) => host.includes(d))) return true;
+    if (siteExcluded()) return false;
+    if (CONFIG.sites.extra.some((d) => hostMatch(host, d))) return true;
+    // 适配名单里的站：域名优先用 MP 站点表的（站点改名不用改脚本），拉不到用内置
+    if (MP_SITES.some((d) => hostMatch(host, d))) return true;
+    if (BUILTIN_SITES.some((d) => hostMatch(host, d))) return true;
     // 未在内置名单：默认不跑，避免误伤学校/无关站点；打开 autoDetectSite 后按页面特征识别
     if (CONFIG.behavior.autoDetectSite && document.querySelector('a[href*="details.php?id="]') != null) return true;
     return false;
@@ -431,10 +517,13 @@
       const cell = a.closest('td') || a.parentElement;
       if (cell) {
         const clone = cell.cloneNode(true);
-        // .optiontag 是站点自己的标签（Dolby Vision/国语/中字/HDR10），
-        // 留在副标题里会跟中文片名粘成一片（「中字HDR10倩女幽魂2：人间道」），
-        // 干扰插件侧从副标题里抽中文片名
-        clone.querySelectorAll('a, script, style, .ptmc-badge, .ptmc-holder, .optiontag, img')
+        // 站点自己的装饰要在取副标题前剔掉，否则会跟中文片名粘成一片：
+        //   · .optiontag  —— HDSKY 等的标签（Dolby Vision/国语/中字/HDR10）
+        //   · .tag/.hot/.circle —— 彩虹岛(CHD)的标签胶囊（官方/独占/DIY/国语/中字/特效）、
+        //                          热度角标、编码圆圈（h5）；不剔的话「官方」「独占」
+        //                          会被插件当成片名候选，真正的片名反而排到后面
+        clone.querySelectorAll('a, script, style, .ptmc-badge, .ptmc-holder, .optiontag, '
+          + 'img, .tag, [class^="tag-"], .circle, .hot')
           .forEach((n) => n.remove());
         subtitle = clone.textContent.replace(/\s+/g, ' ').trim().slice(0, 300);
       }
@@ -654,11 +743,13 @@
   }
 
   async function run() {
-    if (!siteAllowed()) return;
     if (!mpHost()) {
       log('未设置 MoviePilot 地址：油猴菜单 →「① 设置 MP 地址与 API Key」');
       return;
     }
+    if (siteExcluded()) return;          // 例外名单直接不跑，连清单都不拉
+    await loadMpSites();                 // 站点清单以 MP 为准（失败退回内置名单）
+    if (!siteAllowed()) return;
     injectStyle();
     if (isDetailPage()) await renderDetail();
     if (CONFIG.behavior.listPage && isListPage()) await renderList();
@@ -703,6 +794,19 @@
         ontimeout: () => alert('超时：' + url),
       });
     });
+    GM_registerMenuCommand('④ 重新拉取适配站点域名', async () => {
+      try {
+        const keys = (GM_listValues ? GM_listValues() : []).filter((k) => /^q_sites_/.test(k));
+        keys.forEach((k) => GM_deleteValue(k));
+      } catch (e) {}
+      sitesPromise = null;
+      const list = await loadMpSites(true);
+      const cur = location.hostname;
+      const state = siteExcluded() ? '在排除名单里，不适用'
+        : (siteAllowed() ? '适用' : '不适用');
+      alert(`适配站点域名（${list.length} 个）：\n${list.join('\n') || '（没取到，用内置名单）'}\n\n`
+        + `当前站点 ${cur}：${state}`);
+    });
   }
 
   /* =====================================================================
@@ -724,11 +828,13 @@
   // 供 Node 单测导出
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-      CONFIG, BUILTIN_SITES, hash, badgeHtml, listPendingHtml, listFailHtml,
+      CONFIG, BUILTIN_SITES, ADAPTED_SITE_NAMES, hash, badgeHtml, listPendingHtml, listFailHtml,
       panelHtml, tagsHtml,
       siteAllowed, isListPage, isDetailPage, collectListItems, collectDetailItem,
       torrentIdOf, isCounterText, isSubViewLink, anchorScore, imdbOfRow,
       checkLibrary, checkTorrentCached, mpKey, renderList, renderDetail,
+      hostMatch, loadMpSites, siteExcluded,
+      getMpSites: () => MP_SITES, setMpSites: (v) => { MP_SITES = v || []; },
     };
   }
 })();

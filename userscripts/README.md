@@ -27,19 +27,15 @@
                  └─────────────────┘     └──────────────┘
 ```
 
-**为什么这么拆**（对比"油猴自己直连 Emby/Plex"）：
+**为什么这么拆**（油猴不自己连 Emby/Plex）：
 
-| | 直连版 | 插件版（本方案） |
-|---|---|---|
-| 密钥 | 3 把（Emby/Plex/MP）要写进脚本 | **0 把**。凭据全在 MP 侧 |
-| 标题识别 | 自带正则 + 调 recognize | MP 原生 `MetaInfo` + TMDB 识别，与订阅同款 |
-| 多服务器 | 只能连一个 | 遍历 MP 里配置的所有，逐个找 |
-| 分集判断 | 自己查 episodes + PlaybackInfo | 插件直接列在库季集 |
-| 油猴体积 | 717 行 | ~430 行，只管 DOM |
-| GreasyFork 发布 | 发布前必须记得清空密钥 | 无需清理任何东西 |
-| MP 挂了 | 还能查 Emby | 全挂 → 用直连版兜底 |
+- **密钥只有 0 把**：Emby/Plex 凭据全留在 MP 侧，脚本里没有可泄漏的东西
+- **识别用 MP 原生链路**：`MetaInfo` 解析 + TMDb 识别，跟订阅/整理同款，不会各说各话
+- **多服务器**：遍历 MP 里配置的所有媒体服务器，逐个找
+- **分集判断**：插件直接列在库季集，油猴不用自己拼 episodes 请求
+- **油猴只管 DOM**：体积小、改样式不动数据层
 
-直连版保留为 `PT媒体库检测-直连版.user.js`，需要时把 `CONFIG` 里的密钥填上即可用。
+> 早期的「直连版」（油猴自己连 Emby/Plex）已废弃并下架，本仓库只维护插件版。
 
 ---
 
@@ -47,13 +43,11 @@
 
 | 文件 | 说明 |
 |---|---|
-| `PT媒体库检测.user.js` | **主交付物**。瘦油猴客户端 v2.0.0，只存 MP 地址 |
-| `PT媒体库检测-直连版.user.js` | 兜底版。自己直连 Emby/Plex，密钥默认全空 |
-| `pt-plugin/plugins.v3/ptlibrarycheck/__init__.py` | MP 插件 `PtLibraryCheck` |
-| `pt-plugin/package.v3.json` | 插件市场索引（key = 插件类名） |
-| `tests/test_mp_plugin.py` | 插件单测（79 项，MP 模块全打桩） |
-| `tests/test_direct.js` | 直连版单测（23 项） |
-| `tests/test_userscript.js` | 瘦客户端单测（15 项） |
+| `userscripts/PT媒体库检测.user.js` | **主交付物**。瘦油猴客户端，只存 MP 地址 |
+| `plugins.v3/ptlibrarycheck/__init__.py` | MP 插件 `PtLibraryCheck` |
+| `package.v3.json` | 插件市场索引（key = 插件类名） |
+| `tests/test_mp_plugin.py` | 插件单测（173 项，MP 模块全打桩） |
+| `tests/test_userscript.js` | 瘦客户端单测（25 项） |
 
 ---
 
@@ -167,6 +161,23 @@ GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&i
 > `seasons` 为控制响应体大小，每季最多回 20 集；`episode_count` 是该季在库真实
 > 总数（油猴显示为 `S01(20+/40集)`）。`episode.found` 用完整列表判断，不受截断影响。
 
+```http
+GET /api/v1/plugin/PtLibraryCheck/sites
+```
+
+返回 MP 站点表里的站点名与域名（供油猴判断「当前页面适不适用」）：
+
+```json
+{"success": true, "data": {
+  "count": 92, "active": 78,
+  "sites": [{"name": "彩虹岛", "domain": "ptchdbits.co",
+             "hosts": ["ptchdbits.co"], "active": true}]
+}}
+```
+
+`hosts` 同时从 `domain` 字段与站点 URL 的主机名推导（去掉 `www.`），
+空域名条目自动跳过；结果在插件内存里缓存 5 分钟。
+
 插件配置项（MP 插件页）：
 
 | 项 | 默认 | 说明 |
@@ -193,28 +204,38 @@ GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&i
 
 ## 六、站点适配
 
-内置 20 个国内 NexusPHP 站（不含学校站）：
+**只适配这几个站**，其它站一律不跑：
 
-```text
-ourbits.club  pterclub.com  hdarea.club  mteam.cc  hdsky.me  chdbits.cid
-pthome.net  soulvoice.club  hdhome.org  totheglory.im  springsunday.net
-nicept.net  hhanclub.top  52pt.site  audiences.me  hdatmos.club  hdfans.org
-ubits.club  pttime.org  pt.keepfrds.com
-```
+| 站点 | 域名 |
+|---|---|
+| 天空 HDSKY（参照实现） | `hdsky.me` |
+| 彩虹岛 CHDBits（岛） | `ptchdbits.co` |
+| 春天 Spring Sunday | `springsunday.net` |
+| 猫站 PterClub | `pterclub.net` / `pterclub.com` |
+| 我堡 OurBits | `ourbits.club` |
+| 观众 Audiences | `audiences.me` |
+| 憨憨 HHanClub | `hhanclub.net` / `hhanclub.top` |
+| 听听歌 TTG | `totheglory.im` |
 
-增删站点改脚本顶部：
+**域名以 MP 站点表为准**：脚本启动时调插件 `GET /api/v1/plugin/PtLibraryCheck/sites`，
+按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空）取出对应域名。
+所以站点改域名（`hhanclub.top` → `hhanclub.net`）**只需在 MP 里改，脚本不用重新发版**；
+拉不到时退回脚本内置的同名域名清单。
+
+增删适配站改脚本顶部（`ADAPTED_SITE_NAMES` 用 MP 站点名，`BUILTIN_SITES` 是兜底域名）：
 
 ```javascript
+const ADAPTED_SITE_NAMES = ['天空', '彩虹岛', '春天', '猫站', '我堡', '观众', '憨憨', '听听歌'];
 sites: {
-  extra: ['pt.example.com'],   // 额外启用
-  exclude: ['byr.pt'],         // 排除（优先于 extra）
+  extra: ['pt.example.com'],   // 临时启用某域名（站点换了域名但 MP 还没改时用）
+  exclude: ['hdsky.me'],       // 临时关掉名单里的某个站（优先级最高）
 },
-behavior: { autoDetectSite: false },  // 学校站请保持 false
 ```
 
 NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标题单元格内的
-副标题）已经覆盖绝大多数站点；个别魔改站点如果徽标位置不对，调
-`collectListItems()` / `collectDetailItem()` 里的选择器即可。
+副标题）已覆盖这些站；彩虹岛的标签胶囊（`.tag` 官方/独占/DIY/国语/中字/特效）、
+热度角标（`.hot`）与编码圈（`.circle`）会在取副标题前剔掉，否则「官方」「独占」
+会被当成片名候选。个别站徽标位置不对时，调 `collectListItems()` 里的选择器即可。
 
 ---
 
@@ -222,14 +243,13 @@ NexusPHP 的通用结构（`table.torrents` / `a[href*="details.php?id="]` / 标
 
 ```bash
 # MP 插件（把 MP 模块全打桩，不依赖真实 MP）
-python tests/test_mp_plugin.py          # 101 项
+python tests/test_mp_plugin.py          # 173 项
 
-# 油猴（Node 22 自带 test runner + jsdom）
-node tests/test_direct.js               # 23 项
-node tests/test_userscript.js           # 19 项
+# 油猴（Node 自带 test runner + jsdom）
+node tests/test_userscript.js           # 25 项
 ```
 
-当前状态：**143 项全过**。
+当前状态：**198 项全过**。
 
 ---
 
@@ -280,5 +300,5 @@ grep -nE "(apikey|api_key|token)" PT媒体库检测.user.js | grep -v "^\s*//"
 只应看到 `CONFIG.mp.apiKey: ''`（空占位）和菜单/存储相关的变量名，
 不应出现任何一串真实密钥。
 
-直连版 `PT媒体库检测-直连版.user.js` 含 `SECRETS` 区块，**不要发布**，
-只作本机兜底。
+工作区里的脚本是「干净版」（`host` / `apiKey` 都是空串），
+本机安装副本另存于 `.workbuddy/private/tm-install-local.user.js`，不要提交。

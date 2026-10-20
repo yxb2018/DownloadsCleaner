@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # 官方插件开发指南（V3）：插件应优先从 app.sdk 稳定 SDK 导入，
 # 不要直接依赖 app.application / app.domain 的内部文件位置。
@@ -69,6 +69,27 @@ def _normalize_imdb(value: Any) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _host_of(value: str) -> str:
+    """从 domain / url 里取出小写主机名（去 www.），取不到就返回空串。
+
+    MP 站点表里 domain 通常就是主机名（ptchdbits.co），url 可能带协议、
+    端口与路径（https://pt.soulvoice.club/），两种都要能吃。
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "//" not in text:
+        text = "//" + text
+    try:
+        host = urlparse(text).hostname or ""
+    except ValueError:
+        return ""
+    host = host.strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 class PtLibraryCheck(_PluginBase):
     """PT 站点媒体库存在性与画质查询。"""
 
@@ -76,7 +97,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.8"
+    plugin_version = "1.1.9"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -93,6 +114,8 @@ class PtLibraryCheck(_PluginBase):
     # 超了就是 504（前端表现为 network error）。所以必须自己先收手。
     _total_timeout = 20
     _recognize_timeout = 6
+    # 站点域名清单的内存缓存：(时间戳, 载荷)。MP 的站点表不常变，5 分钟足够。
+    _sites_cache: Optional[Tuple[float, Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -214,6 +237,16 @@ class PtLibraryCheck(_PluginBase):
         """
         return [
             {
+                "path": "/sites",
+                "endpoint": self.sites,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "allow_anonymous": self._allow_anonymous,
+                "summary": "返回 MP 已配置站点的名称与域名",
+                "description": "油猴脚本用它判断当前页面是不是 MP 里配过的站点，"
+                               "站点改域名后不必改脚本（只需在 MP 里更新站点地址）",
+            },
+            {
                 "path": "/check",
                 "endpoint": self.check,
                 "methods": ["GET", "POST"],
@@ -224,6 +257,67 @@ class PtLibraryCheck(_PluginBase):
                                "返回存在性、在库版本画质与分集情况",
             }
         ]
+
+    async def sites(self) -> Dict[str, Any]:
+        """站点清单：以 MP 站点表为准，避免油猴里硬编码域名过期。
+
+        返回的 hosts 同时包含 domain 字段与站点 URL 的主机名（去 www.），
+        油猴拿它和 location.hostname 做「后缀匹配」，子域也能命中。
+        """
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        import asyncio
+        try:
+            data = await asyncio.to_thread(self._list_sites)
+        except Exception as err:  # noqa: BLE001 - 接口不能把异常抛给前端
+            return {"success": False, "message": f"读取站点列表失败：{err}"}
+        return {"success": True, "data": data}
+
+    def _list_sites(self) -> Dict[str, Any]:
+        """读 MP 站点表并归一成 {name, hosts, active}。5 分钟内复用内存结果。"""
+        now = time.time()
+        cached = self._sites_cache
+        if cached and now - cached[0] < 300:
+            return cached[1]
+
+        rows: List[Any] = []
+        for module_name, class_name in (
+            ("app.db.oper.site", "SiteOper"),
+            ("app.db.site_oper", "SiteOper"),   # 早期 V3 路径兜底
+        ):
+            try:
+                module = __import__(module_name, fromlist=[class_name])
+                rows = getattr(module, class_name)().list() or []
+                break
+            except Exception:  # noqa: BLE001 - 换路径继续试
+                continue
+
+        sites: List[Dict[str, Any]] = []
+        for row in rows:
+            name = str(getattr(row, "name", "") or "").strip()
+            domain = str(getattr(row, "domain", "") or "").strip()
+            url = str(getattr(row, "url", "") or "").strip()
+            hosts: List[str] = []
+            for cand in (domain, url):
+                host = _host_of(cand)
+                if host and host not in hosts:
+                    hosts.append(host)
+            if not hosts:
+                continue
+            sites.append({
+                "name": name,
+                "domain": domain,
+                "hosts": hosts,
+                "active": bool(getattr(row, "is_active", True)),
+            })
+
+        payload = {
+            "count": len(sites),
+            "active": len([s for s in sites if s["active"]]),
+            "sites": sites,
+        }
+        self._sites_cache = (now, payload)
+        return payload
 
     async def check(self,
                     title: str = "",
