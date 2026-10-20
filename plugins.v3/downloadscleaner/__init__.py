@@ -7,10 +7,11 @@
           + 已确认媒体入库（MP 整理记录成功）。
 清理动作：每轮刷新"待删除列队"（WEBUI 可见），空间低于阈值时才按做种时长从长到短删，
           直到空间回到目标线或达到单轮上限（可选连同本地文件、MP 历史记录、空目录回收）。
-标签机制（无人值守，每轮自动执行）：
-          ① 带「已入库待确认」标签且 MP 整理记录出现（入库确认）→ 自动移除标签，回归删除列队；
-          ② 清理范围内、已完成、带「已整理」标签但 MP 无整理记录（入库存疑）→ 自动打上
-             「已入库待确认」标签并提示，保护不删；
+标签机制（无人值守，每轮自动执行，本插件仅管理唯一标签「未入库待确认」）：
+          ① 带「未入库待确认」标签且 MP 整理记录出现成功（已入库确认）→ 自动移除标签，回归删除列队；
+          ② 清理范围内、已完成、带 MP「已整理」标签且 MP 有整理记录但结果为失败 → 自动打上
+             「未入库待确认」标签并提示，保护不删；
+             注意：带「已整理」标签但 MP 无任何整理记录的种子不在此列（按用户约定不理会）。
           仍受保护的种子形成清单快照，在 WEBUI 顶部与消息通知中持续提示，
           直到 qB 里不再有该标签为止；用户是否处理都不影响插件运行。
 
@@ -66,10 +67,10 @@ class DownloadsCleaner(_PluginBase):
 
     plugin_name = "下载目录空间清理"
     plugin_desc = ("磁盘可用空间低于阈值时，自动清理下载目录中已入库、做种超时的下载任务；"
-                   "支持目录白名单、排除目录、保护标签（含未入库保护标签自动打标与解除）、"
+                   "支持目录白名单、排除目录、保护标签（含未入库待确认标签自动打标与解除）、"
                    "完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -99,9 +100,12 @@ class DownloadsCleaner(_PluginBase):
     _min_ratio = 0.0
     _min_size_gb = 0.0
     _require_library = True
-    # 未入库保护标签：疑似入库失败的种子由插件自动打上该标签获得保护（不删）；
-    # MP 整理记录出现（入库确认）后自动移除——与 MP"整理成功自动打已整理"同原理
-    _unconfirmed_tag = "已入库待确认"
+    # 未入库待确认标签（本插件唯一管理的标签）：MP 已整理（带「已整理」标签）但整理记录为失败的种子，
+    # 由插件自动打上该标签获得保护（不删）；MP 整理记录出现成功（已入库确认）后自动移除。
+    # 带「已整理」标签但 MP 无任何整理记录的种子不在此列（按用户约定不理会）。
+    _unconfirmed_tag = "未入库待确认"
+    # 改名迁移用：旧版曾用名，仅用于把已保存配置 / 既有 qB 标签平滑迁到新名，迁移期内仍受保护
+    _LEGACY_UNCONFIRMED_TAG = "已入库待确认"
     _delete_files = True
     _delete_history = True
     _clean_empty_dirs = False
@@ -140,8 +144,12 @@ class DownloadsCleaner(_PluginBase):
         self._min_ratio = max(0.0, self._to_float(config.get("min_ratio"), 0.0))
         self._min_size_gb = max(0.0, self._to_float(config.get("min_size_gb"), 0.0))
         self._require_library = bool(config.get("require_library", True))
-        # 未入库保护标签：命中即保护；MP 整理记录出现（入库确认）后自动移除
-        self._unconfirmed_tag = str(config.get("unconfirmed_tag") or self._unconfirmed_tag).strip()
+        # 未入库待确认标签：命中即保护；MP 整理记录成功（入库确认）后自动移除
+        raw_tag = str(config.get("unconfirmed_tag") or self._unconfirmed_tag).strip()
+        # 改名迁移：旧名「已入库待确认」自动映射为新名「未入库待确认」，无需手动改配置
+        if raw_tag == self._LEGACY_UNCONFIRMED_TAG:
+            raw_tag = self._unconfirmed_tag
+        self._unconfirmed_tag = raw_tag
         self._delete_files = bool(config.get("delete_files", True))
         self._delete_history = bool(config.get("delete_history", True))
         self._clean_empty_dirs = bool(config.get("clean_empty_dirs"))
@@ -264,7 +272,7 @@ class DownloadsCleaner(_PluginBase):
             logger.error(f"{self.LOG_TAG}本轮执行异常终止：{err}", exc_info=True)
 
     def _run_round(self):
-        # 未入库保护标签维护：一遍扫描（疑似入库失败自动打标 / 入库确认自动摘标），
+        # 未入库待确认标签维护：一遍扫描（已整理但整理记录失败自动打标 / 入库成功自动摘标），
         # 与空间状态无关，每轮最先执行（只动标签不动任务，演练模式下同样生效）
         self._maintain_unconfirmed_tag()
 
@@ -385,9 +393,11 @@ class DownloadsCleaner(_PluginBase):
 
         transfer_oper = TransferHistoryOper()
         protected = {t.strip() for t in self._protect_tags if t.strip()}
-        # 未入库保护标签同样命中即跳过（疑似入库待确认的种子一律不删）
+        # 未入库待确认标签（含改名前的旧名）命中即跳过（疑似入库失败的种子一律不删）
         if self._unconfirmed_tag:
             protected.add(self._unconfirmed_tag)
+        # 兼容改名前的旧标签名，迁移期内同样保护
+        protected.add(self._LEGACY_UNCONFIRMED_TAG)
         block_words = [k.strip() for k in self._block_keywords if k.strip()]
         services = self._get_services()
         if not services:
@@ -450,12 +460,13 @@ class DownloadsCleaner(_PluginBase):
             logger.warning(f"{self.LOG_TAG}没有可连接的下载器，取消本轮")
         return active
 
-    # ---------------------------------------------------------------- 未入库保护标签
+    # ---------------------------------------------------------------- 未入库待确认标签
 
     def _maintain_unconfirmed_tag(self):
-        """未入库保护标签维护（每轮最先执行，与空间状态无关，演练模式下同样生效）：
-        一遍扫描双方向——疑似入库失败（已整理但无整理记录）自动打标保护，
-        MP 整理记录出现（入库确认）自动摘标回归删除列队；
+        """未入库待确认标签维护（每轮最先执行，与空间状态无关，演练模式下同样生效）：
+        一遍扫描双方向——已整理但整理记录为失败（存在失败记录）的种子自动打标保护，
+        MP 整理记录出现成功（已入库确认）自动摘标回归删除列队；
+        带「已整理」标签但 MP 无任何整理记录的种子不理会；
         仍受保护的种子形成清单快照，在 WEBUI 顶部与消息通知中持续提示，
         直到 qB 里不再有该标签为止；用户是否处理都不影响插件运行。"""
         if not self._unconfirmed_tag:
@@ -484,9 +495,9 @@ class DownloadsCleaner(_PluginBase):
         })
         if not (tagged or released or old_hashes != new_hashes):
             return
-        message = f"【{self.plugin_name}】未入库保护标签维护\n"
+        message = f"【{self.plugin_name}】未入库待确认标签维护\n"
         if tagged:
-            message += (f"- {len(tagged)} 个种子疑似入库失败（已整理但无整理记录），"
+            message += (f"- {len(tagged)} 个种子已整理但 MP 整理记录为失败，"
                         f"已打保护标签「{self._unconfirmed_tag}」：\n")
             message += "\n".join(f"  · {name}" for name in tagged) + "\n"
         if released:
@@ -515,10 +526,11 @@ class DownloadsCleaner(_PluginBase):
         return self._unconfirmed_tag in tags
 
     def _scan_unconfirmed_tag(self) -> Tuple[List[str], List[str], List[Dict[str, Any]], bool]:
-        """未入库保护标签一遍扫描（双方向，无人值守）：
-        ① 带「已入库待确认」标签：MP 整理记录出现（入库确认）→ 自动移除标签，回归删除列队；
-        ② 未带标签：清理范围内、已完成、带 MP「已整理」标签但无整理记录
-           （疑似入库失败）→ 自动打上「已入库待确认」标签保护，并计入提示清单。
+        """未入库待确认标签一遍扫描（双方向，无人值守）：
+        ① 已带「未入库待确认」标签：MP 整理记录出现成功（入库确认）→ 自动移除标签，回归删除列队；
+        ② 未带标签：清理范围内、已完成、带 MP「已整理」标签且 MP 有整理记录但结果为失败
+           → 自动打上「未入库待确认」标签保护，并计入提示清单。
+           带「已整理」标签但 MP 无任何整理记录的种子不在此列（按用户约定不理会）。
         返回 (新打标签名, 已自动摘标签名, 仍受保护清单, 是否成功读取过下载器)。"""
         tagged: List[str] = []
         released: List[str] = []
@@ -561,28 +573,25 @@ class DownloadsCleaner(_PluginBase):
                     "seed_days": round(int(torrent.get("seeding_time") or 0) / 86400, 1),
                     "size": int(torrent.get("size") or 0),
                 }
-                if self._unconfirmed_tag in tags:
-                    # ① 已带保护标签：入库确认→摘除回归删除列队；否则继续保护
-                    if not self._is_in_library(transfer_oper, torrent_hash):
-                        protected.append(entry)
-                        continue
-                    try:
-                        ok = instance.remove_torrents_tag(
-                            ids=[torrent_hash], tag=self._unconfirmed_tag
-                        )
-                    except Exception as err:
-                        logger.warning(f"{self.LOG_TAG}移除保护标签失败 [{name[:60]}]：{err}")
-                        protected.append(entry)
-                        continue
-                    if ok:
+                has_tag = self._unconfirmed_tag in tags or self._LEGACY_UNCONFIRMED_TAG in tags
+                if has_tag:
+                    # ① 已带标签：入库成功（有成功整理记录）→摘除标签回归删除列队；否则继续保护
+                    if self._transfer_state(transfer_oper, torrent_hash) == "success":
+                        for _t in (self._unconfirmed_tag, self._LEGACY_UNCONFIRMED_TAG):
+                            if _t in tags:
+                                try:
+                                    instance.remove_torrents_tag(ids=[torrent_hash], tag=_t)
+                                except Exception as err:
+                                    logger.warning(f"{self.LOG_TAG}移除保护标签失败 [{name[:60]}]：{err}")
                         released.append(name[:60])
                         logger.info(
                             f"{self.LOG_TAG}[{name[:60]}] 已确认入库，自动移除保护标签"
                             f"「{self._unconfirmed_tag}」"
                         )
                         time.sleep(0.3)
-                    else:
-                        protected.append(entry)
+                        continue
+                    # 未入库（失败或记录缺失）：继续保护
+                    protected.append(entry)
                     continue
                 # ② 未带标签：只处理清理范围内、已完成、带 MP「已整理」标签的种子；
                 #    已带其它保护标签的不重复打标；整理记录在的（入库确认）不动
@@ -599,7 +608,10 @@ class DownloadsCleaner(_PluginBase):
                     continue
                 if _ORGANIZED_TAG not in tags:
                     continue
-                if self._is_in_library(transfer_oper, torrent_hash):
+                # 仅「已整理」且 MP 有整理记录但结果为失败（failed）才打标；
+                # 已入库成功（success）无需保护；已整理但无任何记录（none）按约定不理会
+                state = self._transfer_state(transfer_oper, torrent_hash)
+                if state != "failed":
                     continue
                 try:
                     instance.set_torrents_tag(ids=[torrent_hash], tags=[self._unconfirmed_tag])
@@ -613,7 +625,7 @@ class DownloadsCleaner(_PluginBase):
                 tagged.append(name[:60])
                 protected.append(entry)
                 logger.info(
-                    f"{self.LOG_TAG}[{name[:60]}] 疑似入库失败（已整理但无整理记录），"
+                    f"{self.LOG_TAG}[{name[:60]}] 已整理但 MP 整理记录为失败，"
                     f"已打保护标签「{self._unconfirmed_tag}」"
                 )
                 time.sleep(0.3)
@@ -664,7 +676,7 @@ class DownloadsCleaner(_PluginBase):
                 return None
             in_library = False
             if self._require_library:
-                in_library = self._is_in_library(transfer_oper, torrent_hash)
+                in_library = self._transfer_state(transfer_oper, torrent_hash) == "success"
                 if not in_library:
                     return None
             return {
@@ -683,18 +695,25 @@ class DownloadsCleaner(_PluginBase):
 
     # ---------------------------------------------------------------- 入库核验
 
-    def _is_in_library(self, transfer_oper: TransferHistoryOper, torrent_hash: str) -> bool:
-        """媒体已入库才算可删：MP 整理记录成功（目标路径在媒体库内）。"""
+    def _transfer_state(self, transfer_oper: TransferHistoryOper, torrent_hash: str) -> str:
+        """查询该 hash 的 MP 整理记录状态（核心判定，3 态）：
+        - "success": 存在成功且目标在媒体库内的记录（已入库，可删）
+        - "failed":  存在整理记录但均非成功入库（MP 已整理但结果是失败）
+        - "none":    无任何整理记录
+        约定：「已整理」标签 + 有失败记录 = 未入库待确认（需人工核查，插件自动保护）；
+        「已整理」标签 + 无任何记录 = 无需理会（MP 已加标签但无记录，非本插件职责）。"""
         try:
             records = transfer_oper.list_by_hash(torrent_hash) or []
         except Exception as err:
             logger.warning(f"{self.LOG_TAG}查询整理记录失败 {torrent_hash[:12]}：{err}")
-            return False
+            return "none"
+        if not records:
+            return "none"
         for record in records:
             dest = str(getattr(record, "dest", "") or "")
             if getattr(record, "status", None) and dest.startswith("/Media/"):
-                return True
-        return False
+                return "success"
+        return "failed"
 
     # ---------------------------------------------------------------- 删除动作
 
@@ -1037,24 +1056,24 @@ class DownloadsCleaner(_PluginBase):
                             }),
                         ],
                     },
-                    # 第七行：未入库保护标签
+                    # 第七行：未入库待确认标签
                     {
                         "component": "VRow",
                         "content": [
                             self._col(12, 6, {
                                 "component": "VTextField",
-                                "props": {"model": "unconfirmed_tag", "label": "未入库保护标签名",
-                                          "placeholder": "已入库待确认",
-                                          "hint": "清理范围内「已整理但无整理记录」的种子自动打上该标签保护；"
-                                                  "整理记录出现（入库确认）后自动移除",
+                                "props": {"model": "unconfirmed_tag", "label": "未入库待确认标签名",
+                                          "placeholder": "未入库待确认",
+                                          "hint": "本插件唯一管理的标签。清理范围内「已整理且 MP 整理记录为失败」的"
+                                                  "种子自动打上该标签保护；已入库成功（整理记录成功）后自动移除",
                                           "persistent-hint": True},
                             }),
                             self._col(12, 6, {
                                 "component": "VAlert",
                                 "props": {"type": "info", "variant": "tonal",
-                                          "text": "标签机制：疑似入库失败（带「已整理」标签但 MP 无整理记录）的种子"
-                                                  "由插件自动打上该标签保护并提示，无需人工维护名单；"
-                                                  "整理记录出现确认入库后插件自动摘除，回归删除列队"},
+                                          "text": "标签机制：本插件仅管理唯一标签「未入库待确认」。已整理但 MP 整理记录"
+                                                  "为失败的种子由插件自动打上该标签保护并提示；带「已整理」但 MP 无"
+                                                  "任何记录的种子不理会；整理记录成功确认入库后插件自动摘除，回归删除列队"},
                             }),
                         ],
                     },
@@ -1120,7 +1139,7 @@ class DownloadsCleaner(_PluginBase):
             "min_ratio": 0,
             "min_size_gb": 0,
             "require_library": True,
-            "unconfirmed_tag": "已入库待确认",
+            "unconfirmed_tag": "未入库待确认",
             "delete_files": True,
             "delete_history": True,
             "clean_empty_dirs": False,
@@ -1207,14 +1226,14 @@ class DownloadsCleaner(_PluginBase):
             },
         })
 
-        # 未入库保护标签说明卡（配置态提示；受保护清单见顶部横幅）
+        # 未入库待确认标签说明卡（配置态提示；受保护清单见顶部横幅）
         tag_card = self._col(12, 12, {
             "component": "VAlert",
             "props": {
                 "type": "info", "variant": "tonal",
-                "text": (f"未入库保护标签「{self._unconfirmed_tag or '未配置'}」：清理范围内"
-                         f"「已整理但无整理记录」的种子自动打上该标签保护，qB 中命中该标签的种子"
-                         f"一律不删；MP 整理记录出现（入库确认）后自动移除标签，回归删除列队"),
+                "text": (f"未入库待确认标签「{self._unconfirmed_tag or '未配置'}」（本插件唯一标签）：清理范围内"
+                         f"「已整理且 MP 整理记录为失败」的种子自动打上该标签保护，qB 中命中该标签的种子"
+                         f"一律不删；MP 整理记录成功（已入库确认）后自动移除标签，回归删除列队"),
             },
         })
 
