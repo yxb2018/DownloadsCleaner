@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.15"
+    plugin_version = "1.1.16"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -739,8 +739,54 @@ class PtLibraryCheck(_PluginBase):
                                    season, episode, imdb, None)
             if hit:
                 rest = [(n, s2, srv, st, it, sc) for n, s2, srv, st, it, sc in first_hits[1:]]
+                # 【补搜】其它服务器候选还是空时，先识别一次拿中文片名再补搜——
+                # Plex 只能按名字搜、库内主名常是中文（实测《华颐》：带 imdb 直查
+                # Emby 先命中直接返回，识别从没跑过，Plex 拿英文名永远 0 候选，
+                # sources 就漏掉了明明在库的 Plex）
+                backfill = [t for t in collected if t[0] != name and not t[4]]
+                recog_names: List[str] = []
+                recog_tid = None
+                if backfill and time.time() < deadline:
+                    remain3 = deadline - time.time()
+                    info3, timed_out3, cost3 = self._recognize_bounded(
+                        meta, is_tv, imdb,
+                        timeout=min(float(self._budget("recognize_timeout", 6)), remain3),
+                    )
+                    if dbg is not None:
+                        dbg["recognize_for_sources"] = {
+                            "cost": round(cost3, 2), "timed_out": timed_out3,
+                            "ok": info3 is not None,
+                        }
+                    if info3 is not None:
+                        recog_tid, _recog, recog_names = self._absorb_recognized(info3, names)
+                if recog_names:
+                    # 补搜前一轮 0 候选的服务器（只补空的，不重复打扰有候选的）
+                    for idx, (n2, s2, srv2, st2, items2) in enumerate(list(collected)):
+                        if n2 == name or items2:
+                            continue
+                        if time.time() > deadline:
+                            break
+                        try:
+                            if st2 == "plex":
+                                more = self._search_plex(srv2, recog_names, is_tv, imdb)
+                            else:
+                                more = self._search_emby(srv2, recog_names, is_tv, imdb)
+                        except Exception as err:  # noqa: BLE001
+                            errors.append(f"{n2}: {err}")
+                            continue
+                        merged, seen2 = [], set()
+                        for it2 in (items2 or []) + more:
+                            k2 = it2.get("Id") or it2.get("ratingKey") or id(it2)
+                            if k2 in seen2:
+                                continue
+                            seen2.add(k2)
+                            merged.append(it2)
+                        collected[idx] = (n2, s2, srv2, st2, merged)
                 sources = [self._source_of(n, s2, st, it) for n, s2, _srv, st, it, _sc in rest]
-                sources += self._collect_sources(collected, name, names, year, None, imdb)
+                # 评分时把识别出的中文名也带上（Plex/Emby 库内主名可能是译名），
+                # tmdb_id 有就给（Plex guid 的 tmdb 匹配 +200 分）
+                sources += self._collect_sources(collected, name, names + recog_names,
+                                                 year, recog_tid, imdb)
                 self._attach_sources(hit, sources)
                 return _done(hit)
             # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
