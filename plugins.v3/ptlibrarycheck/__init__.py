@@ -164,7 +164,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.13"
+    plugin_version = "1.1.14"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -194,6 +194,9 @@ class PtLibraryCheck(_PluginBase):
     # Plex 的 machineIdentifier（每台服务器只问一次，进程内缓存）
     _plex_mid_lock = threading.Lock()
     _plex_mid: Dict[str, str] = {}
+    # Emby 的 serverId（服务器 GUID，deep link 必带，同上进程内缓存）
+    _emby_sid_lock = threading.Lock()
+    _emby_sid: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -944,6 +947,36 @@ class PtLibraryCheck(_PluginBase):
                 self._plex_mid[name] = mid
         return mid
 
+    def _emby_server_id(self, svc: Any) -> str:
+        """Emby 的 serverId（服务器 GUID，每台服务器只问一次，进程内缓存）。
+
+        Emby Web 的 deep link 必须带 serverId，否则 web 客户端路由不认识、
+        停在一个黑屏页面。/System/Info/Public 是匿名端点，Emby / Jellyfin 都有。
+        """
+        name = str(getattr(svc, "name", None) or "")
+        with self._emby_sid_lock:
+            cached = self._emby_sid.get(name)
+        if cached:
+            return cached
+        sid = ""
+        inst = getattr(svc, "instance", None)
+        if inst is not None:
+            for path in ("/System/Info/Public", "/emby/System/Info/Public"):
+                try:
+                    res = inst.get_data(path)
+                    txt = res.text if hasattr(res, "text") else str(res or "")
+                    import json as _json
+                    data = _json.loads(txt)
+                    sid = str(data.get("Id") or data.get("serverId") or "")
+                except Exception:  # noqa: BLE001
+                    continue
+                if sid:
+                    break
+        if sid and name:
+            with self._emby_sid_lock:
+                self._emby_sid[name] = sid
+        return sid
+
     def _play_url(self, stype: str, svc: Any, item_id: Any) -> str:
         """媒体服务器自己的网页播放页（给油猴做「在 Plex / Emby 播放」按钮）。"""
         if not self._play_link or not item_id:
@@ -959,8 +992,16 @@ class PtLibraryCheck(_PluginBase):
                 return ""
             return (f"{host}/web/index.html#!/server/{mid}"
                     f"/details?key=/library/metadata/{item_id}")
-        # Emby / Jellyfin 网页端详情页
-        return f"{host}/web/index.html#!/details?id={item_id}"
+        if stype == "jellyfin":
+            # Jellyfin Web 的详情页路由
+            return f"{host}/web/index.html#!/details?id={item_id}"
+        # Emby Web：deep link 是 #!/item?id=<id>&serverId=<服务器 GUID>。
+        # 之前拼成 #!/details?id=（那是 Jellyfin 的路由），Emby 打开是黑屏；
+        # 不带 serverId 也是黑的 —— web 客户端不知道要连哪台服务器。
+        sid = self._emby_server_id(svc)
+        if not sid:
+            return ""
+        return f"{host}/web/index.html#!/item?id={item_id}&serverId={sid}"
 
     def _source_of(self, name: str, svc: Any, stype: str, item: dict) -> Dict[str, Any]:
         """把「另一台服务器上也有」整理成一个来源条目（只带展示与播放所需字段）。"""

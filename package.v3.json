@@ -22,11 +22,12 @@
     "name": "PT媒体库检测",
     "description": "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。",
     "labels": "媒体库",
-    "version": "1.1.13",
+    "version": "1.1.14",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.14": "修正 Emby 播放按钮打开黑屏：Emby Web 的 deep link 是 #!/item?id=<id>&serverId=<服务器GUID>，之前拼成了 #!/details?id=（那是 Jellyfin 的路由），Emby 4.x 的 web 客户端不认识，打开就是黑屏；而且不带 serverId 也不行——web 端不知道要连哪台服务器。现在 Emby 会先取 /System/Info/Public 拿服务器 GUID（每台只问一次、进程内缓存），拼出 #!/item?id=<id>&serverId=<GUID>；Jellyfin 保持 #!/details?id= 不变。版本号升级同时让旧的坏链接缓存（24h）自动失效。",
       "v1.1.13": "修正「列表页显示库内、详情页却显示未找到」：IMDb 现在只是快路径而非唯一路径。站点填的 IMDb 常常指向信息不全的条目（实测 tt35521394 只能解出「Tokyo Taxi」，解不出中文名「东京出租车」），此前一旦走 IMDb 识别产不出新片名，第二轮就无从补搜，明明库里有却报「媒体库无此资源」。现在带 IMDb 的识别没能给出任何新候选片名时，会再退回纯片名识别补一次搜索（debug=1 时记在 recognize_fallback 里）；IMDb 识别本身有效则不会多花这一次开销。",
       "v1.1.12": "详情页播放按钮：命中结果新增 play_url（媒体服务器自己的网页播放页），Plex 用 /web/index.html#!/server/<machineId>/details、Emby/Jellyfin 用 /web/index.html#!/details?id=；machineId 每台服务器只问一次并进程内缓存。全量查询（lite=0）不再命中第一台服务器就返回，而是把其余服务器也搜完，同一部片在两台服务器上都有时一并返回 sources 列表（server/server_type/item_id/play_url），油猴据此同时显示 Plex 与 Emby 播放按钮；列表页浅查询（lite=1）仍是命中即返回，不多花时间。新增插件配置项 play_link（默认开）可关闭播放链接。",
       "v1.1.11": "列表页/详情页两级查询（lite 浅查询）：列表页只需要知道「在不在库里」，现在传 lite=1 时只用搜索结果本身判断——Plex 不再多拉一次 /library/metadata、Emby 不再拉分集列表与分集画质，剧集也不再算季集，一条查询从最多 3 次媒体服务器请求降到 1 次。详情页打开时才用 lite=0 拿全量（画质/音轨/字幕/路径/季集/缺集），油猴会把列表页已经查到的结论直接铺在详情页面板上，先显示结论再补全细节。lite 与 full 的缓存、同题合并 key 都分开，互不覆盖。",
