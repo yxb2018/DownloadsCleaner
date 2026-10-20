@@ -14,6 +14,7 @@
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
 """
 
+import hashlib
 import inspect
 import re
 import threading
@@ -75,7 +76,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -265,7 +266,11 @@ class PtLibraryCheck(_PluginBase):
         cache_key = None
         if self._cache_hours > 0 and not debug:
             raw = f"{imdb}|{title}\n{subtitle}|{want_season}|{want_episode}"
-            cache_key = _CACHE_PREFIX + str(abs(hash(raw)))
+            # 版本号并入 key：判定逻辑一改，旧版本写下的结论就必须失效，
+            # 否则升级后页面还在用上一版的（错误）判断。
+            # 用 md5 而不是内置 hash()：后者按进程随机加盐，重启后缓存全废。
+            digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+            cache_key = f"{_CACHE_PREFIX}{self.plugin_version}_{digest}"
             hit = self.get_data(cache_key)
             if isinstance(hit, dict) and hit.get("_t"):
                 if time.time() - hit["_t"] < self._cache_hours * 3600:
