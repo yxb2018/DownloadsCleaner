@@ -138,6 +138,7 @@ GET /api/v1/plugin/PtLibraryCheck/check?title=<标题>[&subtitle=<副标题>][&i
 - 插件代码：`plugins.v3/ptlibrarycheck/`，清单：`package.v3.json`
 - 配套油猴脚本：`userscripts/PT媒体库检测.user.js`（脚本内不含任何域名与密钥，
   地址/Key 由油猴菜单录入并只存在 Tampermonkey 存储里），说明见 `userscripts/README.md`
+- 油猴脚本已发布到 GreasyFork：<https://greasyfork.org/zh-CN/scripts/601229>
 
 ## License
 

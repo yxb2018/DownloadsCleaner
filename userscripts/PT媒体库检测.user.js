@@ -4,6 +4,7 @@
 // @version      2.3.0
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
+// @license      MIT
 // @match        *://*.audiences.me/*
 // @match        *://*.hdsky.me/*
 // @match        *://*.hhanclub.net/*

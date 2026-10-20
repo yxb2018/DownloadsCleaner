@@ -11,6 +11,12 @@
 
 ---
 
+> **GreasyFork 安装页**：<https://greasyfork.org/zh-CN/scripts/601229>
+> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.0，作者 `yxb2018`）
+> 发布版本不含任何 MP 地址与 API Key，装好后需在油猴菜单里自行填写。
+
+---
+
 ## 一、架构：MP 插件 + 瘦油猴
 
 ```
@@ -413,6 +419,12 @@ node tests/test_userscript.js           # 44 项
 ---
 
 ## 十、发布到 GreasyFork
+
+**已发布**：<https://greasyfork.org/zh-CN/scripts/601229>（脚本 ID 601229，2026-10-20 上线 v2.3.0）。
+
+发布页是 `https://greasyfork.org/zh-CN/script_versions/new`（`/scripts/new` 会 404）。
+注意 GreasyFork **要求脚本头声明 `@license`**，否则提交会被拦回「您尚未声明@license」；
+本脚本已加 `// @license MIT`。
 
 主脚本 `PT媒体库检测.user.js` **不含任何密钥**，可直接发布。
 发布前仍建议自查一遍：
