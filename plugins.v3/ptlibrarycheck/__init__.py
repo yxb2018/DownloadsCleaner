@@ -165,7 +165,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.21"
+    plugin_version = "1.1.22"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -185,10 +185,10 @@ class PtLibraryCheck(_PluginBase):
     # 站点域名清单的内存缓存：(时间戳, 载荷)。MP 的站点表不常变，5 分钟足够。
     _sites_cache: Optional[Tuple[float, Dict[str, Any]]] = None
     # 进程级并发闸门（所有标签页共用）与「同题合并」表。
-    # 10 是压测出来的上游舒适区：25 并发时 Emby 搜索与 TMDb 识别互相拖垮
-    # （4 条 504、8 条预算用尽，命中也从 0.5s 拖到 20s），10 并发仍有拥堵，
-    # 配合下面的识别限流后 miss 才能稳定在预算内返回。
-    _gate = _ConcurrencyGate(10)
+    # 6 是压测定的值：这台 NAS 的上游吞吐约每秒 1 条 miss（Emby 搜索与 TMDb
+    # 识别都会在服务器端排队），10/25 并发只会增加排队与超时（实测 10 并发
+    # 仍有 504 与预算用尽），不增加吞吐。命中是快路径（0.2s）不受影响。
+    _gate = _ConcurrencyGate(6)
     # 识别限流：实测 6 条并发识别全部 4~6s 超时（单发只要 2.6s）——
     # 并发识别会让 TMDb/MP 识别链路互相拖垮，还把每条查询的 20s 预算耗光。
     # 全局最多 2 条同时识别；等不到名额的查询立即放弃识别、按片名搜索结果
@@ -250,9 +250,9 @@ class PtLibraryCheck(_PluginBase):
                 setattr(self, attr, default)
         # 并发上限是进程级的，配置改了立刻对所有标签页生效
         try:
-            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 10)))
+            self._gate.set_limit(max(1, int(config.get("max_concurrent") or 6)))
         except (TypeError, ValueError):
-            self._gate.set_limit(10)
+            self._gate.set_limit(6)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -334,7 +334,7 @@ class PtLibraryCheck(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "max_concurrent",
-                            "label": "并发上限（所有标签页合计，建议 10；0 或空按 10）",
+                            "label": "并发上限（所有标签页合计，建议 6；0 或空按 6）",
                             "type": "number",
                         },
                     },
