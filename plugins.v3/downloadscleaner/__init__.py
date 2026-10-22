@@ -69,7 +69,7 @@ class DownloadsCleaner(_PluginBase):
                    "支持目录白名单、排除目录、保护标签（含未入库待确认标签自动打标与解除）、"
                    "完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.3.1"
+    plugin_version = "2.3.2"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -493,26 +493,30 @@ class DownloadsCleaner(_PluginBase):
             "items": protected,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
-        if not (tagged or released or old_hashes != new_hashes):
-            return
-        message = "未入库待确认标签维护\n"
-        if tagged:
-            message += (f"- {len(tagged)} 个种子已整理但 MP 整理记录为失败，"
-                        f"已打保护标签「{self._unconfirmed_tag}」：\n")
-            message += "\n".join(f"  · {name}" for name in tagged) + "\n"
-        if released:
-            message += (f"- {len(released)} 个种子已确认入库，自动移除标签"
-                        f"「{self._unconfirmed_tag}」：\n")
-            message += "\n".join(f"  · {name}" for name in released) + "\n"
-        if protected:
-            names = "、".join(p["name"][:30] for p in protected[:10])
-            message += (f"- 仍受保护 {len(protected)} 个（跳过清理）：{names}"
-                        + (f" 等共 {len(protected)} 个" if len(protected) > 10 else ""))
         logger.info(
             f"{self.LOG_TAG}标签维护完成：新保护 {len(tagged)} 个，"
             f"自动解除 {len(released)} 个，仍受保护 {len(protected)} 个"
         )
-        self._notify(message)
+        # 没有任何可说的内容就不发：正文只剩标题行的空通知只会制造噪音
+        # （保护清单变化但没有新打标/新摘标时，只记日志）
+        if not (tagged or released or protected):
+            if old_hashes != new_hashes:
+                logger.info(f"{self.LOG_TAG}受保护清单已清空（{len(old_hashes)} → 0），不发送通知")
+            return
+        lines = ["未入库待确认标签维护"]
+        if tagged:
+            lines.append(f"- {len(tagged)} 个种子已整理但 MP 整理记录为失败，"
+                         f"已打保护标签「{self._unconfirmed_tag}」：")
+            lines.extend(f"  · {name}" for name in tagged)
+        if released:
+            lines.append(f"- {len(released)} 个种子已确认入库，自动移除标签"
+                         f"「{self._unconfirmed_tag}」：")
+            lines.extend(f"  · {name}" for name in released)
+        if protected:
+            names = "、".join(p["name"][:30] for p in protected[:10])
+            lines.append(f"- 仍受保护 {len(protected)} 个（跳过清理）：{names}"
+                         + (f" 等共 {len(protected)} 个" if len(protected) > 10 else ""))
+        self._notify("\n".join(lines))
 
     def _tag_applied(self, instance: Any, hash_: str) -> bool:
         """回读种子标签，确认保护标签确实已打上（qB 打标签封装无返回值）。"""
