@@ -165,7 +165,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.22"
+    plugin_version = "1.1.23"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -356,7 +356,7 @@ class PtLibraryCheck(_PluginBase):
             "cache_hours": 24,
             "total_timeout": 20,
             "recognize_timeout": 6,
-            "max_concurrent": 3,
+            "max_concurrent": 6,
             "gate_timeout": 25,
         }
 

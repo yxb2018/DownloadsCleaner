@@ -37,8 +37,7 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 from app.sdk.services import DownloaderHelper, ServiceConfigHelper
-from app.schemas import NotificationType
-from app.schemas.types import NotificationChannel
+from app.schemas.types import MessageType, NotificationChannel
 
 BS = chr(92)  # 反斜杠，避免源码转义歧义
 GIB = 1024 ** 3
@@ -70,7 +69,7 @@ class DownloadsCleaner(_PluginBase):
                    "支持目录白名单、排除目录、保护标签（含未入库待确认标签自动打标与解除）、"
                    "完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.3.0"
+    plugin_version = "2.3.1"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -317,7 +316,8 @@ class DownloadsCleaner(_PluginBase):
                 f"{self._threshold_free_gb:.0f}GiB，但没有符合清理条件的下载任务"
             )
             logger.warning(f"{self.LOG_TAG}{message}")
-            self._notify(f"【{self.plugin_name}】\n{message}")
+            # 标题由 _notify 统一加【插件名】前缀，正文不再重复
+            self._notify(message)
             return
 
         deleted: List[Dict[str, Any]] = []
@@ -360,7 +360,7 @@ class DownloadsCleaner(_PluginBase):
         self._record_run(deleted, freed_bytes, failed, tagged, mode)
 
         summary = (
-            f"【{self.plugin_name}】{mode}完成\n"
+            f"{mode}完成\n"
             f"监控盘：{self._monitor_path}\n"
             f"删除任务：{len(deleted)} 个，释放 {freed_bytes / GIB:.2f}GiB"
         )
@@ -495,7 +495,7 @@ class DownloadsCleaner(_PluginBase):
         })
         if not (tagged or released or old_hashes != new_hashes):
             return
-        message = f"【{self.plugin_name}】未入库待确认标签维护\n"
+        message = "未入库待确认标签维护\n"
         if tagged:
             message += (f"- {len(tagged)} 个种子已整理但 MP 整理记录为失败，"
                         f"已打保护标签「{self._unconfirmed_tag}」：\n")
@@ -830,20 +830,30 @@ class DownloadsCleaner(_PluginBase):
             self.save_data("history", history[-100:])
 
     def _notify(self, text: str):
+        """发送插件通知。
+
+        标题统一由这里加【插件名】前缀，调用方正文不要再带同名前缀，
+        否则通知中心会把标题与首行正文渲染成重复的两行。
+        渠道为多选，需要逐个发送；未选渠道时传 None 交给宿主默认路由。
+        """
         if not self._notify_enabled:
             return
         channels = [c for c in (_CHANNEL_MAP.get(ch) for ch in self._notify_channels) if c]
+        # channels 为空 -> [None]，表示按宿主默认渠道发送
+        targets = list(channels) if channels else [None]
+        title = f"【{self.plugin_name}】"
 
         def _send():
-            try:
-                self.post_message(
-                    channel=channels[0] if channels else None,
-                    mtype=NotificationType.SiteMessage,
-                    title=f"【{self.plugin_name}】",
-                    text=text,
-                )
-            except Exception as err:
-                logger.debug(f"{self.LOG_TAG}通知发送失败：{err}")
+            for target in targets:
+                try:
+                    self.post_message(
+                        channel=target,
+                        mtype=MessageType.Plugin,
+                        title=title,
+                        text=text,
+                    )
+                except Exception as err:
+                    logger.debug(f"{self.LOG_TAG}通知发送失败（{target}）：{err}")
 
         # 即发即走：通知通道可能阻塞（网络/渠道不可用），绝不能卡住清理主流程
         threading.Thread(target=_send, name="DownloadsCleanerNotify", daemon=True).start()
