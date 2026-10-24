@@ -11,8 +11,19 @@
 - Emby/Jellyfin 有 imdb 时用 AnyProviderIdEquals 直查条目，省掉按片名搜索；
   Plex 用 imdb 给候选加权（guid 里带 imdb://tt... 的直接命中）；
 - 画质信息通过媒体服务器模块自带的 get_data() 取原始 JSON 解析，
-  MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据。
+  MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据；
+- 所有媒体服务器 HTTP 统一走 _svc_get()：MP 单请求超时 20s，而一次搜索会
+  串行发多个请求，不兜底的话单条查询能挂几分钟占死并发闸门（实测 25 分钟），
+  客户端被反代 30s 切断成 504。_svc_get 按「剩余预算」放弃/到点走人。
 """
+
+# 变更记录（倒序）：
+# 1.1.24 修：冷查询把闸门名额占几分钟到几十分钟（反代 504 的根因）。
+#         MP 单请求超时 20s，一次搜索串行 4~6 个请求，deadline 只在步骤之间
+#         检查、单次搜索内部不受约束。新增 _svc_get() 预算兜底（发请求前看
+#         剩余预算 + 守护线程 join 到点走人），所有搜索/画质/分集/播放链接
+#         请求全部收口；闸门排队上限 25s→8s（排队+执行须 < 反代 30s）。
+# 1.1.23 get_form 默认并发 3→6，与 init_plugin 兜底一致。
 
 import asyncio
 import hashlib
@@ -52,6 +63,8 @@ _CACHE_PREFIX = "ptmc_chk_"
 _MAX_SEASONS = 20
 # IMDb ID：tt + 6~10 位数字
 _IMDB_RE = re.compile(r"(tt\d{6,10})", re.I)
+# 剩余预算低于这个值就不再发起新的媒体服务器请求（发了也来不及收尾）
+_MIN_REQUEST_BUDGET = 0.5
 
 # 副标题里常见的发布标签词，抽中文片名时先剔掉它们
 _CN_TAG_WORDS = (
@@ -98,7 +111,11 @@ class _ConcurrencyGate:
     油猴每个标签页各跑一份，页内的限流管不住「同时开 5 个站 = 5 倍并发」。
     真正能兜住的是插件进程里的这道闸：所有 /check 先过闸，
     详情页 / 手动刷新用 high 优先级插队，列表页 normal 排队，
-    等太久（默认 25s）就带着「排队超时」返回，别把反代拖到 504。
+    等太久（默认 8s）就带着「排队超时」返回，别把反代拖到 504。
+
+    排队时长必须与查询预算联动看：反代对单请求 30s 硬切断，客户端可见
+    时间 = 排队 + 执行（执行上限 total_timeout 20s），所以排队最多 8s；
+    超时那一侧返回的 busy 结论油猴会重试，比让整个请求 504 划算。
     """
 
     HIGH = 0
@@ -118,7 +135,7 @@ class _ConcurrencyGate:
             self._limit = max(1, int(limit))
             self._cond.notify_all()
 
-    def acquire(self, priority: int = NORMAL, timeout: float = 25.0) -> bool:
+    def acquire(self, priority: int = NORMAL, timeout: float = 8.0) -> bool:
         """拿到一个执行位就返回 True；超时返回 False（调用方回「排队超时」）。"""
         deadline = time.time() + max(0.0, float(timeout))
         with self._cond:
@@ -165,7 +182,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.23"
+    plugin_version = "1.1.24"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -205,7 +222,9 @@ class PtLibraryCheck(_PluginBase):
     # 不用 asyncio.to_thread（走默认池，线程数 = min(32, CPU+4)，
     # NAS 上常常只有 12 个线程，闸门放行了也没线程干活）。
     _query_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="PtLibraryCheck")
-    _gate_timeout = 25.0
+    # 闸门排队上限：反代 30s 硬切断 = 排队 + 执行，执行上限 20s（total_timeout），
+    # 所以排队最多 8s。超时返回 busy（油猴会重试），别让整个请求 504。
+    _gate_timeout = 8.0
     _flight_lock = threading.Lock()
     _inflight: Dict[str, threading.Event] = {}
     _flight_results: Dict[str, Dict[str, Any]] = {}
@@ -242,7 +261,7 @@ class PtLibraryCheck(_PluginBase):
         for attr, key, default in (
             ("_total_timeout", "total_timeout", 20),
             ("_recognize_timeout", "recognize_timeout", 6),
-            ("_gate_timeout", "gate_timeout", 25),
+            ("_gate_timeout", "gate_timeout", 8),
         ):
             try:
                 setattr(self, attr, max(1, int(config.get(key) or default)))
@@ -342,7 +361,8 @@ class PtLibraryCheck(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "gate_timeout",
-                            "label": "排队等待上限（秒，建议 25；超时返回「查询排队超时」）",
+                            "label": "排队等待上限（秒，建议 8；排队+执行需 < 反代 30s，"
+                                     "超时返回可重试的「查询排队超时」）",
                             "type": "number",
                         },
                     },
@@ -357,7 +377,7 @@ class PtLibraryCheck(_PluginBase):
             "total_timeout": 20,
             "recognize_timeout": 6,
             "max_concurrent": 6,
-            "gate_timeout": 25,
+            "gate_timeout": 8,
         }
 
     # ------------------------------------------------------------------
@@ -725,7 +745,8 @@ class PtLibraryCheck(_PluginBase):
                 continue
             t_srv = time.time()
             try:
-                items = self._search_server(name, stype, server, names, is_tv, imdb)
+                items = self._search_server(name, stype, server, names, is_tv,
+                                            imdb, deadline)
             except Exception as err:  # noqa: BLE001 - 单个服务器失败不影响其他
                 errors.append(f"{name}: {err}")
                 continue
@@ -747,7 +768,8 @@ class PtLibraryCheck(_PluginBase):
                 if lite:
                     # 列表页浅查询：命中就走，别为其它服务器多花时间
                     hit = self._hit_result(name, svc, server, stype, best[0], is_tv,
-                                           season, episode, imdb, None, lite=True)
+                                           season, episode, imdb, None, lite=True,
+                                           deadline=deadline)
                     if hit:
                         return _done(hit)
                 else:
@@ -757,7 +779,7 @@ class PtLibraryCheck(_PluginBase):
         if first_hits:
             name, svc, server, stype, item, _score = first_hits[0]
             hit = self._hit_result(name, svc, server, stype, item, is_tv,
-                                   season, episode, imdb, None)
+                                   season, episode, imdb, None, deadline=deadline)
             if hit:
                 rest = [(n, s2, srv, st, it, sc) for n, s2, srv, st, it, sc in first_hits[1:]]
                 # 【补搜】其它服务器候选还是空时，先识别一次拿中文片名再补搜——
@@ -803,7 +825,7 @@ class PtLibraryCheck(_PluginBase):
                             break
                         try:
                             more = self._search_server(n2, st2, srv2, recog_names,
-                                                       is_tv, imdb)
+                                                       is_tv, imdb, deadline)
                         except Exception as err:  # noqa: BLE001
                             errors.append(f"{n2}: {err}")
                             continue
@@ -822,11 +844,12 @@ class PtLibraryCheck(_PluginBase):
                             seen2.add(k2)
                             merged.append(it2)
                         collected[idx] = (n2, s2, srv2, st2, merged)
-                sources = [self._source_of(n, s2, st, it) for n, s2, _srv, st, it, _sc in rest]
+                sources = [self._source_of(n, s2, st, it, deadline)
+                           for n, s2, _srv, st, it, _sc in rest]
                 # 评分时把识别出的中文名也带上（Plex/Emby 库内主名可能是译名），
                 # tmdb_id 有就给（Plex guid 的 tmdb 匹配 +200 分）
                 sources += self._collect_sources(collected, name, names + recog_names,
-                                                 year, recog_tid, imdb)
+                                                 year, recog_tid, imdb, deadline)
                 self._attach_sources(hit, sources)
                 return _done(hit)
             # 候选为空时不必再等其它服务器 —— 但其它服务器可能有，所以继续
@@ -899,7 +922,7 @@ class PtLibraryCheck(_PluginBase):
                     break
                 try:
                     more = self._search_server(name, stype, server, extra_names,
-                                               is_tv, imdb)
+                                               is_tv, imdb, deadline)
                 except Exception as err:  # noqa: BLE001
                     errors.append(f"{name}: {err}")
                     continue
@@ -940,7 +963,7 @@ class PtLibraryCheck(_PluginBase):
                             continue
                         try:
                             more4 = self._search_server(name2, stype2, server2,
-                                                        extra4, is_tv, imdb)
+                                                        extra4, is_tv, imdb, deadline)
                         except Exception as err:  # noqa: BLE001
                             errors.append(f"{name2}: {err}")
                             continue
@@ -979,12 +1002,13 @@ class PtLibraryCheck(_PluginBase):
                     suspect = best
                 continue
             hit = self._hit_result(name, svc, server, stype, best[0], is_tv,
-                                   season, episode, imdb, matched_by, lite=lite)
+                                   season, episode, imdb, matched_by, lite=lite,
+                                   deadline=deadline)
             if hit:
                 # 详情页：其余服务器上一并命中的也带上（两个播放按钮）
                 if not lite:
                     self._attach_sources(hit, self._collect_sources(
-                        collected, name, names, year, tmdb_id, imdb))
+                        collected, name, names, year, tmdb_id, imdb, deadline))
                 return _done(hit)
 
         if time.time() > deadline:
@@ -1054,7 +1078,8 @@ class PtLibraryCheck(_PluginBase):
                 return v.rstrip("/")
         return seen[0].rstrip("/") if seen else ""
 
-    def _plex_machine_id(self, svc: Any) -> str:
+    def _plex_machine_id(self, svc: Any,
+                         deadline: Optional[float] = None) -> str:
         """Plex 的 machineIdentifier（每台服务器只问一次，进程内缓存）。"""
         name = str(getattr(svc, "name", None) or "")
         with self._plex_mid_lock:
@@ -1065,8 +1090,10 @@ class PtLibraryCheck(_PluginBase):
         inst = getattr(svc, "instance", None)
         if inst is not None:
             for path in ("/", "/identity"):
+                if deadline is not None and time.time() >= deadline:
+                    break
                 try:
-                    res = inst.get_data(path)
+                    res = self._svc_get(inst, path, deadline)
                     txt = res.text if hasattr(res, "text") else str(res or "")
                 except Exception:  # noqa: BLE001
                     continue
@@ -1080,7 +1107,8 @@ class PtLibraryCheck(_PluginBase):
                 self._plex_mid[name] = mid
         return mid
 
-    def _emby_server_id(self, svc: Any) -> str:
+    def _emby_server_id(self, svc: Any,
+                        deadline: Optional[float] = None) -> str:
         """Emby 的 serverId（服务器 GUID，每台服务器只问一次，进程内缓存）。
 
         Emby Web 的 deep link 必须带 serverId，否则 web 客户端路由不认识、
@@ -1099,8 +1127,10 @@ class PtLibraryCheck(_PluginBase):
             import json as _json
             for path in ("[HOST]/emby/System/Info/Public?X-Emby-Token=[APIKEY]",
                          "[HOST]/System/Info/Public?X-Emby-Token=[APIKEY]"):
+                if deadline is not None and time.time() >= deadline:
+                    break
                 try:
-                    res = inst.get_data(path)
+                    res = self._svc_get(inst, path, deadline)
                     txt = res.text if hasattr(res, "text") else str(res or "")
                     data = _json.loads(txt)
                     sid = str(data.get("Id") or data.get("serverId") or "")
@@ -1113,7 +1143,8 @@ class PtLibraryCheck(_PluginBase):
                 self._emby_sid[name] = sid
         return sid
 
-    def _play_url(self, stype: str, svc: Any, item_id: Any) -> str:
+    def _play_url(self, stype: str, svc: Any, item_id: Any,
+                  deadline: Optional[float] = None) -> str:
         """媒体服务器自己的网页播放页（给油猴做「在 Plex / Emby 播放」按钮）。"""
         if not self._play_link or not item_id:
             return ""
@@ -1123,7 +1154,7 @@ class PtLibraryCheck(_PluginBase):
         item_id = str(item_id)
         if stype == "plex":
             # Plex Web 必须有 server(machineIdentifier)，否则会停在选择服务器页
-            mid = self._plex_machine_id(svc)
+            mid = self._plex_machine_id(svc, deadline)
             if not mid:
                 return ""
             return (f"{host}/web/index.html#!/server/{mid}"
@@ -1134,12 +1165,13 @@ class PtLibraryCheck(_PluginBase):
         # Emby Web：deep link 是 #!/item?id=<id>&serverId=<服务器 GUID>。
         # 之前拼成 #!/details?id=（那是 Jellyfin 的路由），Emby 打开是黑屏；
         # 不带 serverId 也是黑的 —— web 客户端不知道要连哪台服务器。
-        sid = self._emby_server_id(svc)
+        sid = self._emby_server_id(svc, deadline)
         if not sid:
             return ""
         return f"{host}/web/index.html#!/item?id={item_id}&serverId={sid}"
 
-    def _source_of(self, name: str, svc: Any, stype: str, item: dict) -> Dict[str, Any]:
+    def _source_of(self, name: str, svc: Any, stype: str, item: dict,
+                   deadline: Optional[float] = None) -> Dict[str, Any]:
         """把「另一台服务器上也有」整理成一个来源条目（只带展示与播放所需字段）。"""
         item_id = item.get("ratingKey") if stype == "plex" else item.get("Id")
         return {
@@ -1148,12 +1180,13 @@ class PtLibraryCheck(_PluginBase):
             "item_id": item_id,
             "title": item.get("title") or item.get("Name") or "",
             "year": item.get("year") or item.get("ProductionYear") or "",
-            "play_url": self._play_url(stype, svc, item_id),
+            "play_url": self._play_url(stype, svc, item_id, deadline),
         }
 
     def _collect_sources(self, collected: List[Tuple[str, Any, Any, str, List[dict]]],
                          primary: str, names: List[str], year: Optional[str],
-                         tmdb_id: Optional[str], imdb: str) -> List[Dict[str, Any]]:
+                         tmdb_id: Optional[str], imdb: str,
+                         deadline: Optional[float] = None) -> List[Dict[str, Any]]:
         """其余媒体服务器上命中同一个片子的，也一起返回（两台都有就给两个播放按钮）。"""
         out: List[Dict[str, Any]] = []
         for name, svc, _server, stype, items in collected:
@@ -1163,7 +1196,7 @@ class PtLibraryCheck(_PluginBase):
                                           emby=(stype != "plex"), imdb=imdb)
             if not best or best[1] < 95:
                 continue
-            out.append(self._source_of(name, svc, stype, best[0]))
+            out.append(self._source_of(name, svc, stype, best[0], deadline))
         return out
 
     @staticmethod
@@ -1186,11 +1219,14 @@ class PtLibraryCheck(_PluginBase):
     def _hit_result(self, name: str, svc: Any, server: Any, stype: str, best: dict,
                     is_tv: bool, season: Optional[int], episode: Optional[int],
                     imdb: str, matched_by: Optional[str],
-                    lite: bool = False) -> Optional[Dict[str, Any]]:
+                    lite: bool = False,
+                    deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
         if stype == "plex":
-            hit = self._finish_plex(server, best, is_tv, season, episode, lite=lite)
+            hit = self._finish_plex(server, best, is_tv, season, episode,
+                                    lite=lite, deadline=deadline)
         else:
-            hit = self._finish_emby(server, best, is_tv, season, episode, lite=lite)
+            hit = self._finish_emby(server, best, is_tv, season, episode,
+                                    lite=lite, deadline=deadline)
         if not hit:
             return None
         if lite:
@@ -1198,7 +1234,7 @@ class PtLibraryCheck(_PluginBase):
             hit["lite"] = True
         hit["server"] = name
         hit["server_type"] = stype
-        hit["play_url"] = self._play_url(stype, svc, hit.get("item_id"))
+        hit["play_url"] = self._play_url(stype, svc, hit.get("item_id"), deadline)
         if imdb:
             hit["imdb"] = imdb
         # 命中依据：条目自身带的 imdb 与请求一致 → imdb；否则就是片名
@@ -1216,6 +1252,47 @@ class PtLibraryCheck(_PluginBase):
             return max(1, int(getattr(self, "_" + key, default) or default))
         except (TypeError, ValueError):
             return default
+
+    def _svc_get(self, server: Any, url: str,
+                 deadline: Optional[float] = None) -> Any:
+        """带预算兜底的媒体服务器请求（主流程所有 HTTP 都走这里）。
+
+        MP 的 RequestUtils 单请求超时是 20s，而一次搜索会串行发 4~6 个请求
+        （Emby：IMDb 直查 + 3 个片名 + 剧集裸名；Plex：3 个片名 × 2 端点），
+        再叠加补搜轮次与命中后的画质/分集请求 —— deadline 只在各步骤之间检查，
+        单次搜索内部完全不受约束，实测一条冷查询把闸门名额占了 25 分钟，
+        客户端被反代 30s 切断成 504。两层保险：
+
+          1) 剩余预算不足以再发一个请求时直接放弃（返回 None，调用方按
+             「无结果」继续，不再无限叠加请求）；
+          2) 请求放守护线程里 join(剩余预算)，MP 那 20s 也没兜住时主流程
+             到点走人；被放弃的线程最多再跑一个 MP 超时后自行结束，
+             不会回来占闸门名额。
+
+        deadline=None 表示不约束（供单测与非查询路径使用）。
+        """
+        if deadline is None:
+            return server.get_data(url)
+        remain = deadline - time.time()
+        if remain < _MIN_REQUEST_BUDGET:
+            return None
+        box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["r"] = server.get_data(url)
+            except Exception as err:  # noqa: BLE001 - 异常交回主线程按原逻辑处理
+                box["e"] = err
+
+        th = threading.Thread(target=_run, name="ptmc-srv-get", daemon=True)
+        th.start()
+        th.join(remain)
+        if th.is_alive():
+            self._log(f"媒体服务器请求超过 {remain:.1f}s 未返回，放弃（预算兜底）：{url[:80]}")
+            return None
+        if "e" in box:
+            raise box["e"]
+        return box.get("r")
 
     @staticmethod
     def _absorb_recognized(info: Any, names: List[str]) -> Tuple[Optional[str], Dict[str, Any], List[str]]:
@@ -1245,11 +1322,15 @@ class PtLibraryCheck(_PluginBase):
         return tmdb_id, recog, extra
 
     def _search_server(self, name: str, stype: str, server: Any,
-                       names: List[str], is_tv: bool, imdb: str) -> List[dict]:
+                       names: List[str], is_tv: bool, imdb: str,
+                       deadline: Optional[float] = None) -> List[dict]:
         """按服务器限流的搜索入口（主流程所有搜索都走这里）。
 
         每台服务器最多 3 个并发搜索；等不到名额（8s）抛错，由调用方的
         except 记到 errors 里继续，不拖垮整条查询。
+
+        deadline 是整条查询的预算终点，传给底层保证「单次搜索」也不会
+        无限发请求（MP 单请求超时 20s，一个搜索动作最多 6 个串行请求）。
         """
         with PtLibraryCheck._srv_sema_lock:
             sema = PtLibraryCheck._srv_sema.get(name)
@@ -1260,8 +1341,8 @@ class PtLibraryCheck(_PluginBase):
             raise RuntimeError("服务器搜索排队超时（每台限 3 并发）")
         try:
             if stype == "plex":
-                return self._search_plex(server, names, is_tv, imdb)
-            return self._search_emby(server, names, is_tv, imdb)
+                return self._search_plex(server, names, is_tv, imdb, deadline)
+            return self._search_emby(server, names, is_tv, imdb, deadline)
         finally:
             sema.release()
 
@@ -1392,7 +1473,8 @@ class PtLibraryCheck(_PluginBase):
         return self._finish_emby(server, best, is_tv, season, episode)
 
     def _search_emby(self, server: Any, names: List[str], is_tv: bool,
-                     imdb: str = "") -> List[dict]:
+                     imdb: str = "",
+                     deadline: Optional[float] = None) -> List[dict]:
         """只做搜索，把候选条目全部返回（选优交给 _pick_best_scored）。"""
         item_type = "Series" if is_tv else "Movie"
         fields = ("Fields=MediaSources,MediaStreams,ProviderIds,ProductionYear,"
@@ -1400,15 +1482,18 @@ class PtLibraryCheck(_PluginBase):
         items: List[dict] = []
         seen = set()
 
+        def _out_of_budget() -> bool:
+            return deadline is not None and time.time() >= deadline
+
         # IMDb 直查：Emby / Jellyfin 的 AnyProviderIdEquals=imdb.tt1234567
         # 一次就能定位条目，省掉按片名搜索 + 名称模糊比对
-        if imdb:
+        if imdb and not _out_of_budget():
             url = (
                 f"[HOST]emby/Items?Recursive=true&IncludeItemTypes={item_type}"
                 f"&AnyProviderIdEquals=imdb.{imdb}&Limit=5&{fields}&api_key=[APIKEY]"
             )
             try:
-                res = server.get_data(url)
+                res = self._svc_get(server, url, deadline)
             except Exception as err:  # noqa: BLE001 - 直查失败退回名称搜索
                 self._log(f"Emby IMDb 直查失败：{err}")
                 res = None
@@ -1419,12 +1504,14 @@ class PtLibraryCheck(_PluginBase):
                         items.append(it)
 
         for term in (names[:3] if not items else []):
+            if _out_of_budget():
+                break
             url = (
                 f"[HOST]emby/Items?Recursive=true&IncludeItemTypes={item_type}"
                 f"&searchTerm={quote(term)}&Limit=20"
                 f"&{fields}&api_key=[APIKEY]"
             )
-            res = server.get_data(url)
+            res = self._svc_get(server, url, deadline)
             if not res:
                 continue
             for it in (res.json() or {}).get("Items") or []:
@@ -1437,6 +1524,8 @@ class PtLibraryCheck(_PluginBase):
         if not items and is_tv:
             # 剧集名里带季号可能搜不到，退回裸名再搜一次
             for term in names[:2]:
+                if _out_of_budget():
+                    break
                 bare = re.sub(r"[第S]\s*\d+[季部]?", "", term).strip()
                 if not bare or bare == term:
                     continue
@@ -1444,7 +1533,7 @@ class PtLibraryCheck(_PluginBase):
                     f"[HOST]emby/Items?Recursive=true&IncludeItemTypes=Series"
                     f"&searchTerm={quote(bare)}&Limit=20&{fields}&api_key=[APIKEY]"
                 )
-                res = server.get_data(url)
+                res = self._svc_get(server, url, deadline)
                 if not res:
                     continue
                 for it in (res.json() or {}).get("Items") or []:
@@ -1457,7 +1546,8 @@ class PtLibraryCheck(_PluginBase):
 
     def _finish_emby(self, server: Any, best: dict, is_tv: bool,
                      season: Optional[int], episode: Optional[int],
-                     lite: bool = False) -> Optional[Dict[str, Any]]:
+                     lite: bool = False,
+                     deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
         out: Dict[str, Any] = {
             "found": True,
             "type": "tv" if is_tv else "movie",
@@ -1473,14 +1563,15 @@ class PtLibraryCheck(_PluginBase):
             return out
 
         # 剧集：列出在库季集
-        seasons = self._emby_seasons(server, best.get("Id"))
+        seasons = self._emby_seasons(server, best.get("Id"), deadline)
         out["seasons"] = {str(k): v for k, v in list(seasons.items())[:_MAX_SEASONS]}
         if season is not None:
             out["episode_count"] = len(seasons.get(season) or [])
         if season is not None and episode is not None and self._episode_check:
             eps = seasons.get(season) or []
             if episode in eps:
-                ep_item = self._emby_episode_item(server, best.get("Id"), season, episode)
+                ep_item = self._emby_episode_item(server, best.get("Id"), season,
+                                                  episode, deadline)
                 if ep_item:
                     out["quality"] = self._emby_quality(ep_item)
                     out["episode"] = {"season": season, "episode": episode, "found": True}
@@ -1491,14 +1582,15 @@ class PtLibraryCheck(_PluginBase):
             out["season_in_library"] = season in seasons
         return out
 
-    def _emby_seasons(self, server: Any, series_id: Optional[str]) -> Dict[int, List[int]]:
+    def _emby_seasons(self, server: Any, series_id: Optional[str],
+                      deadline: Optional[float] = None) -> Dict[int, List[int]]:
         if not series_id:
             return {}
         url = (
             f"[HOST]emby/Items?ParentId={series_id}&IncludeItemTypes=Episode"
             f"&Recursive=true&Fields=Overview&api_key=[APIKEY]"
         )
-        res = server.get_data(url)
+        res = self._svc_get(server, url, deadline)
         if not res:
             return {}
         seasons: Dict[int, List[int]] = {}
@@ -1512,14 +1604,15 @@ class PtLibraryCheck(_PluginBase):
         return dict(sorted(seasons.items()))
 
     def _emby_episode_item(self, server: Any, series_id: Optional[str],
-                           season: int, episode: int) -> Optional[dict]:
+                           season: int, episode: int,
+                           deadline: Optional[float] = None) -> Optional[dict]:
         if not series_id:
             return None
         url = (
             f"[HOST]emby/Items?ParentId={series_id}&IncludeItemTypes=Episode"
             f"&Recursive=true&Fields=MediaSources,MediaStreams&api_key=[APIKEY]"
         )
-        res = server.get_data(url)
+        res = self._svc_get(server, url, deadline)
         if not res:
             return None
         for ep in (res.json() or {}).get("Items") or []:
@@ -1527,9 +1620,11 @@ class PtLibraryCheck(_PluginBase):
                 if not (ep.get("MediaSources") or []):
                     # 少数情况下 Items 不返回 MediaSources，退回 PlaybackInfo
                     uid = getattr(server, "user", "") or ""
-                    pb = server.get_data(
+                    pb = self._svc_get(
+                        server,
                         f"[HOST]emby/Items/{ep.get('Id')}/PlaybackInfo"
-                        f"?UserId={uid}&api_key=[APIKEY]"
+                        f"?UserId={uid}&api_key=[APIKEY]",
+                        deadline,
                     )
                     if pb:
                         return pb.json()
@@ -1550,17 +1645,20 @@ class PtLibraryCheck(_PluginBase):
         return self._finish_plex(server, best, is_tv, season, episode)
 
     def _search_plex(self, server: Any, names: List[str], is_tv: bool,
-                     imdb: str = "") -> List[dict]:
+                     imdb: str = "",
+                     deadline: Optional[float] = None) -> List[dict]:
         """Plex 只能按片名搜，imdb 用于在 _pick_best_scored 里加权。"""
         mtype = 2 if is_tv else 1
         candidates: List[dict] = []
         seen = set()
         for term in names[:3]:
+            if deadline is not None and time.time() >= deadline:
+                break
             for endpoint in (
                 f"/library/all?type={mtype}&title={quote(term)}",
                 f"/search?type={mtype}&query={quote(term)}",
             ):
-                res = server.get_data(endpoint)
+                res = self._svc_get(server, endpoint, deadline)
                 if not res:
                     continue
                 try:
@@ -1578,7 +1676,8 @@ class PtLibraryCheck(_PluginBase):
 
     def _finish_plex(self, server: Any, best: dict, is_tv: bool,
                      season: Optional[int], episode: Optional[int],
-                     lite: bool = False) -> Optional[Dict[str, Any]]:
+                     lite: bool = False,
+                     deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
         rk = best.get("ratingKey")
         out: Dict[str, Any] = {
             "found": True,
@@ -1590,7 +1689,7 @@ class PtLibraryCheck(_PluginBase):
         # Plex 的画质要再拉一次 /library/metadata/<id>，浅查询直接跳过
         if lite:
             return out
-        detail = self._plex_metadata(server, rk)
+        detail = self._plex_metadata(server, rk, deadline)
         if detail:
             out["quality"] = self._plex_quality(detail)
         if not is_tv:
@@ -1599,7 +1698,7 @@ class PtLibraryCheck(_PluginBase):
         # Plex 季集：/library/metadata/<id>/children?type=4 拿不到全集，
         # 直接用 grandchildren 逐季查询太重，这里按 season 查一季
         if season is not None and self._episode_check:
-            eps = self._plex_season_episodes(server, rk, season)
+            eps = self._plex_season_episodes(server, rk, season, deadline)
             out["seasons"] = {str(season): eps[:_MAX_SEASONS]} if eps else {}
             out["episode_count"] = len(eps)
             if episode is not None:
@@ -1610,10 +1709,11 @@ class PtLibraryCheck(_PluginBase):
                     out["reason"] = f"剧集在库，但缺 S{season:02d}E{episode:02d}"
         return out
 
-    def _plex_metadata(self, server: Any, rating_key: Optional[str]) -> Optional[dict]:
+    def _plex_metadata(self, server: Any, rating_key: Optional[str],
+                       deadline: Optional[float] = None) -> Optional[dict]:
         if not rating_key:
             return None
-        res = server.get_data(f"/library/metadata/{rating_key}")
+        res = self._svc_get(server, f"/library/metadata/{rating_key}", deadline)
         if not res:
             return None
         try:
@@ -1622,10 +1722,12 @@ class PtLibraryCheck(_PluginBase):
             return None
 
     def _plex_season_episodes(self, server: Any, rating_key: Optional[str],
-                              season: int) -> List[int]:
+                              season: int,
+                              deadline: Optional[float] = None) -> List[int]:
         if not rating_key:
             return []
-        res = server.get_data(f"/library/metadata/{rating_key}/children?type=4")
+        res = self._svc_get(
+            server, f"/library/metadata/{rating_key}/children?type=4", deadline)
         if not res:
             return []
         try:
@@ -1636,7 +1738,8 @@ class PtLibraryCheck(_PluginBase):
         target = next((s for s in seasons if s.get("index") == season), None)
         if not target:
             return []
-        eps_res = server.get_data(f"/library/metadata/{target.get('ratingKey')}/children")
+        eps_res = self._svc_get(
+            server, f"/library/metadata/{target.get('ratingKey')}/children", deadline)
         if not eps_res:
             return []
         try:
