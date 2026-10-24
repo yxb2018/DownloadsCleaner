@@ -26,6 +26,9 @@
 #         查询先用它判「在不在库里」——命中直接返回（lite 零媒体服务器请求，
 #         full 只多一次播放链接所需的 server_id），未命中才继续走原来的实时
 #         搜索。缓存是快照，未命中不代表不在库，所以绝不把未命中当结论。
+#         IMDb 身份查询必须传真实类型：exist_by_media_identity 的
+#         item_type == mtype 传 None 会被 SQLAlchemy 编译成 IS NULL，永远
+#         匹配不上有条目的行（与 exists_by_title 的「None=不过滤」不同）。
 # 1.1.24 修：冷查询把闸门名额占几分钟到几十分钟（反代 504 的根因）。
 #         MP 单请求超时 20s，一次搜索串行 4~6 个请求，deadline 只在步骤之间
 #         检查、单次搜索内部不受约束。新增 _svc_get() 预算兜底（发请求前看
@@ -1435,10 +1438,14 @@ class PtLibraryCheck(_PluginBase):
                 item = None
                 via = ""
                 # 1) 身份优先：站点给了 IMDb 时最准（库里条目带 imdb 身份）。
-                #    mtype 传 None：身份本身已足够具体，再按类型过滤只会漏。
+                #    mtype 必须传真实类型（电影/电视剧）：MP 的 exist_by_media_identity
+                #    是 item_type == mtype 直等，传 None 会被 SQLAlchemy 编译成
+                #    item_type IS NULL，永远匹配不上有条目的行（exists_by_title 的
+                #    None 才是「不过滤」，两个函数语义不一样，别混）。
+                #    类型被标错的极少数情况交给下面的标题兜底。
                 if imdb and MediaSource is not None:
                     item = MediaServerItem.exist_by_media_identity(
-                        db, MediaSource.IMDb, imdb, None, name)
+                        db, MediaSource.IMDb, imdb, mtype, name)
                     if item is not None:
                         via = "imdb"
                 # 2) 标题候选：库里条目常以中文命名，names 已按「中文副标题名优先」排好
