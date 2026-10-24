@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT 媒体库检测（MoviePilot 插件版）
 // @namespace    https://local.ptmediacheck
-// @version      2.3.4
+// @version      2.3.8
 // @description  在 PT 站点种子列表/详情页标注媒体库是否已有该资源；优先用站点已填的 IMDb ID 识别（最准最快），没有才解析标题+副标题。列表页标「库内 / 未入库」两种状态，详细信息在详情页展示。查询全部走 MoviePilot 的 PtLibraryCheck 插件，油猴本身不保存 Emby/Plex 密钥。
 // @author       yxb2018
 // @license      MIT
@@ -16,6 +16,7 @@
 // @match        *://*.pterclub.net/*
 // @match        *://*.springsunday.net/*
 // @match        *://*.totheglory.im/*
+// @match        *://*.uhddolby.com/*
 // @connect      *
 // 说明：MP 地址由用户在油猴菜单里自行填写，脚本不内置任何具体域名，
 //      因此这里只能用通配 @connect；如你不放心，可改成你自己的 MP 域名。
@@ -31,13 +32,39 @@
 
 /*
  * =====================================================================
- * PT 媒体库检测 · MoviePilot 插件版（v2.3.4）
+ * PT 媒体库检测 · MoviePilot 插件版（v2.3.8）
  * ---------------------------------------------------------------------
  * 架构：本脚本只负责「读页面 DOM + 调 MP 插件接口 + 渲染徽标/面板」。
  *      媒体库存在性、画质、分集判断全部由 MP 的 PtLibraryCheck 插件完成，
  *      凭据用的是 MP 里已配置的媒体服务器，所以：
  *        · 本脚本不需要 Emby / Plex 的任何密钥；
  *        · 只有 MP 插件开启「允许匿名访问」时，才连 MP API Key 都不用填。
+ *
+ * v2.3.8
+ *   · 新增适配站：高清杜比（MP 站点名「高清杜比」）。原域名 hddolby.com 已完全失效
+ *     （连接失败），站点整体迁到 www.uhddolby.com，仍是 NexusPHP 架构
+ *     （Powered by NexusPHP、详情页 details.php?id=），直接走通用适配路径。
+ *     MP 站点表里该站域名同步改成 www.uhddolby.com；内置域名兜底也换成新域名。
+ *
+ * v2.3.7
+ *   · 并发回调 10 → 6：线上实测这台 NAS 的上游（Emby 搜索 / TMDb 识别）
+ *     吞吐约每秒 1 条未命中，并发再高只增加排队与超时（10 并发仍有 504），
+ *     不增加吞吐。命中是快路径（0.2s），前 20 条 20 秒内的目标照常达成；
+ *     24h 结果缓存让重复访问秒刷。
+ *
+ * v2.3.6
+ *   · 并发回调 20 → 10：线上压测 20/25 并发会把 Emby 搜索与 TMDb 识别互相拖垮
+ *     （4 条 504、命中从 0.5s 拖到 20s），10 并发 + 配套插件 1.1.20 的识别限流
+ *     （全局最多 2 条同时识别，等不到名额立即按片名搜索结果兜底）后，
+ *     前一批查询稳定在预算内返回。50ms 间隔不变。
+ *
+ * v2.3.5
+ *   · 列表页提速：页内并发 2 → 20、请求间隔 250ms → 50ms。
+ *     目标：100 条一页，前 20 条 20 秒内出结果。配套插件 1.1.19 把进程级
+ *     并发闸门从 3 提到 25（多标签页共享这道闸），并把查询从默认线程池
+ *     挪到专用线程池（默认池线程数 = min(32, CPU+4)，NAS 上不够 25 并发）。
+ *     单标签页 20 并发已贴近闸门上限；同题合并（single-flight）照常生效，
+ *     多个标签页查同一条只算一次。
  *
  * v2.3.4
  *   · 详情页面板不再显示「路径」行（用户要求：长串无阅读价值，且指向 115 网盘）。
@@ -207,8 +234,9 @@
       autoDetectSite: false, // 未在内置名单的域名，是否靠页面特征自动识别（学校站请保持 false）
       episodeCheck: true,    // 剧集是否查具体分集（关掉只显示「剧集在库」）
       cacheHours: 24,        // 查询缓存时长
-      minIntervalMs: 250,    // 请求最小间隔（只打自己的 MP，无站点风控压力）
-      concurrency: 2,        // 并发数
+      minIntervalMs: 50,     // 请求最小间隔（只打自己的 MP，无站点风控压力）
+      concurrency: 6,        // 并发数（插件闸门同为 6——NAS 上游吞吐就那么大，
+                             // 并发再高只增加排队与超时，不增加吞吐）
       retries: 2,            // 网络错误/超时/5xx 的重试次数（0 = 不重试）
       retryDelayMs: 400,     // 首次重试等待，之后按次数线性递增
       badgeCompact: true,    // 列表页用紧凑徽标
@@ -231,6 +259,7 @@
     '憨憨',             // HHanClub
     '听听歌',           // TTG / ToTheGlory
     '朋友',             // KeepFRDS（MP 站点名是「朋友」）
+    '高清杜比',         // UHDDolby（原 hddolby.com，2026-10 迁到 www.uhddolby.com）
   ];
 
   // 内置域名（与 ADAPTED_SITE_NAMES 对应），MP 不可达时的兜底
@@ -244,6 +273,7 @@
     'hhanclub.net', 'hhanclub.top',
     'totheglory.im',
     'keepfrds.com',      // 朋友 KeepFRDS（MP 里是 keepfrds.com / pt.keepfrds.com）
+    'uhddolby.com',      // 高清杜比 UHDDolby（原 hddolby.com 已失效）
   ];
 
   // 从 MP 站点表里筛出来的适配站域名（loadMpSites 填充）；为空时只用 BUILTIN_SITES

@@ -12,7 +12,7 @@
 ---
 
 > **GreasyFork 安装页**：<https://greasyfork.org/zh-CN/scripts/601229>
-> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.7，作者 `yxb2018`，配套插件 ≥ v1.1.23）
+> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.8，作者 `yxb2018`，配套插件 ≥ v1.1.23）
 > 发布版本不含任何 MP 地址与 API Key，装好后需在油猴菜单里自行填写。
 
 ---
@@ -317,16 +317,17 @@ GET /api/v1/plugin/PtLibraryCheck/stats
 | 憨憨 HHanClub | `hhanclub.net` / `hhanclub.top` |
 | 听听歌 TTG | `totheglory.im`（结构特殊：标题链接 `/t/<id>/`，见下） |
 | 朋友 KeepFRDS | `keepfrds.com`（MP 站点名是「**朋友**」，详情页详情表是 `#tdetail.outerMost`，1680 宽） |
+| 高清杜比 UHDDolby | `uhddolby.com`（MP 站点名是「**高清杜比**」；原 `hddolby.com` 已失效，2026-10 整体迁站；NexusPHP 通用结构） |
 
 **域名以 MP 站点表为准**：脚本启动时调插件 `GET /api/v1/plugin/PtLibraryCheck/sites`，
-按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空 / 朋友）取出对应域名。
+按 MP 里的**站点名**（彩虹岛 / 春天 / 猫站 / 我堡 / 观众 / 憨憨 / 听听歌 / 天空 / 朋友 / 高清杜比）取出对应域名。
 所以站点改域名（`hhanclub.top` → `hhanclub.net`）**只需在 MP 里改，脚本不用重新发版**；
 拉不到时退回脚本内置的同名域名清单。
 
 增删适配站改脚本顶部（`ADAPTED_SITE_NAMES` 用 MP 站点名，`BUILTIN_SITES` 是兜底域名）：
 
 ```javascript
-const ADAPTED_SITE_NAMES = ['天空', '彩虹岛', '春天', '猫站', '我堡', '观众', '憨憨', '听听歌', '朋友'];
+const ADAPTED_SITE_NAMES = ['天空', '彩虹岛', '春天', '猫站', '我堡', '观众', '憨憨', '听听歌', '朋友', '高清杜比'];
 sites: {
   extra: ['pt.example.com'],   // 临时启用某域名（站点换了域名但 MP 还没改时用）
   exclude: ['hdsky.me'],       // 临时关掉名单里的某个站（优先级最高）
