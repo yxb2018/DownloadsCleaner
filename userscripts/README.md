@@ -12,7 +12,7 @@
 ---
 
 > **GreasyFork 安装页**：<https://greasyfork.org/zh-CN/scripts/601229>
-> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.8，作者 `yxb2018`，配套插件 ≥ v1.1.23）
+> （脚本名「PT 媒体库检测（MoviePilot 插件版）」，当前 v2.3.8，作者 `yxb2018`，配套插件 ≥ v1.1.24）
 > 发布版本不含任何 MP 地址与 API Key，装好后需在油猴菜单里自行填写。
 
 ---
