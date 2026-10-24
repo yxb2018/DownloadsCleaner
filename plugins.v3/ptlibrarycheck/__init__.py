@@ -14,10 +14,18 @@
   MediaInfo / MediaServerItem 都不带分辨率与 DoVi 字段，只能走原始数据；
 - 所有媒体服务器 HTTP 统一走 _svc_get()：MP 单请求超时 20s，而一次搜索会
   串行发多个请求，不兜底的话单条查询能挂几分钟占死并发闸门（实测 25 分钟），
-  客户端被反代 30s 切断成 504。_svc_get 按「剩余预算」放弃/到点走人。
+  客户端被反代 30s 切断成 504。_svc_get 按「剩余预算」放弃/到点走人；
+- 查询先查 MP 媒体库缓存（MediaServerItem 表，定时同步的快照）：命中即「在库」，
+  直接给结论、零媒体服务器请求；只有缓存未命中才走实时搜索。媒体服务器链路
+  故障时，列表页靠缓存照样能出结果。
 """
 
 # 变更记录（倒序）：
+# 1.1.25 新增「媒体库缓存优先」：MP 按同步间隔（用户实例全局 6 小时）把各媒体
+#         服务器的条目同步进本地 MediaServerItem 表，这张表就是库的快照。
+#         查询先用它判「在不在库里」——命中直接返回（lite 零媒体服务器请求，
+#         full 只多一次播放链接所需的 server_id），未命中才继续走原来的实时
+#         搜索。缓存是快照，未命中不代表不在库，所以绝不把未命中当结论。
 # 1.1.24 修：冷查询把闸门名额占几分钟到几十分钟（反代 504 的根因）。
 #         MP 单请求超时 20s，一次搜索串行 4~6 个请求，deadline 只在步骤之间
 #         检查、单次搜索内部不受约束。新增 _svc_get() 预算兜底（发请求前看
@@ -56,6 +64,19 @@ try:  # MediaSource 是 MP v3 才有的枚举，缺失时自动降级为标题�
     from app.schemas.types import MediaSource
 except Exception:  # noqa: BLE001
     MediaSource = None  # type: ignore[assignment]
+
+# MP 媒体库缓存（MediaServerItem 表）：MP 按同步间隔把 Emby/Plex 条目同步进
+# 本地库，命中即可判定「在库」，不必再打媒体服务器。导入失败（老宿主 / 精简
+# 环境 / 单测桩不全）时自动降级为纯实时查询，功能不受影响。
+try:
+    from app.db import get_session_factory
+except Exception:  # noqa: BLE001
+    get_session_factory = None  # type: ignore[assignment]
+
+try:
+    from app.db.models.mediaserver import MediaServerItem
+except Exception:  # noqa: BLE001
+    MediaServerItem = None  # type: ignore[assignment]
 
 # 查询结果缓存 key 前缀
 _CACHE_PREFIX = "ptmc_chk_"
@@ -182,7 +203,7 @@ class PtLibraryCheck(_PluginBase):
     plugin_desc = "为 PT 站点油猴脚本提供媒体库存在性与画质查询，复用 MP 已配置的媒体服务器，" \
                   "无需在脚本里保存 Emby/Plex 密钥；优先用站点已填的 IMDb ID 识别。"
     plugin_icon = "icons/ptlibrarycheck.png"
-    plugin_version = "1.1.24"
+    plugin_version = "1.1.25"
     plugin_author = "yxb2018"
     author_url = "https://github.com/yxb2018"
     plugin_label = "媒体库"
@@ -195,6 +216,9 @@ class PtLibraryCheck(_PluginBase):
     _allow_anonymous = False
     _cache_hours = 24
     _episode_check = True
+    # 媒体库缓存优先：先用 MP 的 MediaServerItem 快照判「在不在库里」，
+    # 命中直接返回；未命中才走实时搜索。关掉后恢复纯实时查询。
+    _cache_first = True
     # 时间预算（秒）：油猴脚本走反代，反代对单个请求有 30s 硬上限，
     # 超了就是 504（前端表现为 network error）。所以必须自己先收手。
     _total_timeout = 20
@@ -246,6 +270,7 @@ class PtLibraryCheck(_PluginBase):
         self._allow_anonymous = False
         self._cache_hours = 24
         self._episode_check = True
+        self._cache_first = True
         self._total_timeout = 20
         self._recognize_timeout = 6
         if not config:
@@ -258,6 +283,7 @@ class PtLibraryCheck(_PluginBase):
             self._cache_hours = 24
         self._episode_check = bool(config.get("episode_check", True))
         self._play_link = bool(config.get("play_link", True))
+        self._cache_first = bool(config.get("cache_first", True))
         for attr, key, default in (
             ("_total_timeout", "total_timeout", 20),
             ("_recognize_timeout", "recognize_timeout", 6),
@@ -326,6 +352,14 @@ class PtLibraryCheck(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "cache_first",
+                            "label": "优先查 MP 媒体库缓存（定时同步的快照，命中即库内、不再打媒体服务器；"
+                                     "未命中才实时查询）",
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "cache_hours",
@@ -373,6 +407,7 @@ class PtLibraryCheck(_PluginBase):
             "allow_anonymous": False,
             "episode_check": True,
             "play_link": True,
+            "cache_first": True,
             "cache_hours": 24,
             "total_timeout": 20,
             "recognize_timeout": 6,
@@ -727,6 +762,48 @@ class PtLibraryCheck(_PluginBase):
         services = helper.get_services()
         if not services:
             return _done({"found": False, "reason": "MP 未配置媒体服务器", "title": title})
+
+        # 2.5 先查 MP 媒体库缓存（定时同步的快照，纯 DB 查询）：
+        #     命中即「在库」，直接给结论；未命中才继续下面的实时搜索。
+        #     媒体服务器链路故障时，靠这一步列表页照样能出结果。
+        t_cache = time.time()
+        cache_hits, cache_via = self._cache_probe(services, names, is_tv,
+                                                  imdb, season)
+        if dbg is not None:
+            dbg["cache"] = {
+                "cost": round(time.time() - t_cache, 3),
+                "hits": [{"server": h[0], "item_id": getattr(h[3], "item_id", None),
+                          "title": getattr(h[3], "title", None),
+                          "via": v}
+                         for h, v in zip(cache_hits, cache_via)],
+            }
+        if cache_hits:
+            primary = cache_hits[0]
+            hit = self._cache_hit_result(primary[0], primary[1], primary[2],
+                                         primary[3], is_tv, season, episode,
+                                         imdb, cache_via[0], lite)
+            if not lite and self._play_link:
+                # 播放链接要机器标识/服务器 GUID（每台只问一次，进程内缓存），
+                # 失败就只是没有按钮，不影响「在库」结论
+                hit["play_url"] = self._play_url(primary[2], primary[1],
+                                                 hit.get("item_id"), deadline)
+            # 其它服务器在缓存里也有 → sources（详情页给多个播放按钮）
+            if not lite and len(cache_hits) > 1:
+                sources = []
+                for sname, ssvc, sstype, sitem in cache_hits[1:]:
+                    sources.append({
+                        "server": sname,
+                        "server_type": sstype,
+                        "item_id": getattr(sitem, "item_id", None),
+                        "title": getattr(sitem, "title", None) or "",
+                        "year": getattr(sitem, "year", None) or "",
+                        "play_url": (self._play_url(sstype, ssvc,
+                                                    getattr(sitem, "item_id", None),
+                                                    deadline)
+                                     if self._play_link else ""),
+                    })
+                self._attach_sources(hit, sources)
+            return _done(hit)
 
         errors: List[str] = []
         collected: List[Tuple[str, Any, Any, str, List[dict]]] = []
@@ -1320,6 +1397,126 @@ class PtLibraryCheck(_PluginBase):
             if PtLibraryCheck._informative(value) and value not in names and value not in extra:
                 extra.append(value)
         return tmdb_id, recog, extra
+
+    # ------------------------------------------------------------------
+    # MP 媒体库缓存（定时同步的快照）
+    # ------------------------------------------------------------------
+    def _cache_probe(self, services: Dict[str, Any], names: List[str],
+                     is_tv: bool, imdb: str,
+                     season: Optional[int]) -> Tuple[List[Tuple[str, Any, str, Any]], List[str]]:
+        """先查 MP 的媒体库缓存（MediaServerItem 表），命中即「在库」。
+
+        MP 按同步间隔（用户实例：全局 6 小时）把各媒体服务器的条目同步进本地库，
+        这张表就是媒体库的快照。命中说明条目在上次同步时确实在库里，可以直接
+        给结论，不必再打媒体服务器——媒体服务器链路抖动/故障时，列表页靠缓存
+        照样能出结果，也顺带把「在库」查询从 4~6 个 HTTP 请求降成 0 个。
+
+        缓存是快照，**未命中不代表不在库**（可能是同步后新入库、标题写法不一致、
+        类型标错），所以未命中一律继续走原来的实时搜索，这里只做加速与兜底，
+        绝不把未命中当成结论。
+
+        :return: (命中列表, 命中方式列表)。命中列表元素
+                 [(服务名, svc, stype, 缓存条目), ...]，空列表 = 未命中。
+        """
+        if not self._cache_first or MediaServerItem is None or get_session_factory is None:
+            return [], []
+        # 缓存表里 item_type 存的是 MediaType 的中文值（电影 / 电视剧）
+        mtype = MediaType.TV.value if is_tv else MediaType.MOVIE.value
+        hits: List[Tuple[str, Any, str, Any]] = []
+        how: List[str] = []
+        db = None
+        try:
+            db = get_session_factory()()
+            for name, svc in services.items():
+                raw_type = getattr(svc, "type", None)
+                stype = str(getattr(raw_type, "value", raw_type) or "").lower()
+                if stype not in ("emby", "jellyfin", "plex"):
+                    continue
+                item = None
+                via = ""
+                # 1) 身份优先：站点给了 IMDb 时最准（库里条目带 imdb 身份）。
+                #    mtype 传 None：身份本身已足够具体，再按类型过滤只会漏。
+                if imdb and MediaSource is not None:
+                    item = MediaServerItem.exist_by_media_identity(
+                        db, MediaSource.IMDb, imdb, None, name)
+                    if item is not None:
+                        via = "imdb"
+                # 2) 标题候选：库里条目常以中文命名，names 已按「中文副标题名优先」排好
+                if item is None:
+                    for cand in names:
+                        if not cand:
+                            continue
+                        item = MediaServerItem.exists_by_title(db, cand, mtype, None, name)
+                        if item is not None:
+                            via = "title"
+                            break
+                # 3) 类型兜底：条目类型可能被媒体服务器标错（电影标成剧集之类），
+                #    去掉类型过滤再试一次，代价只是同名列的候选变多
+                if item is None:
+                    for cand in names:
+                        if not cand:
+                            continue
+                        item = MediaServerItem.exists_by_title(db, cand, None, None, name)
+                        if item is not None:
+                            via = "title-anytype"
+                            break
+                if item is None:
+                    continue
+                # 剧集：缓存带季集快照，点名季不在快照里就视作没命中（交给实时查询细查）
+                if is_tv and season is not None:
+                    snap = getattr(item, "seasoninfo", None) or {}
+                    if snap and season not in snap:
+                        continue
+                hits.append((name, svc, stype, item))
+                how.append(via)
+        except Exception as err:  # noqa: BLE001 - 缓存查询失败不能影响主流程
+            self._log(f"媒体库缓存查询失败，继续走实时查询：{err}")
+            return [], []
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return hits, how
+
+    @staticmethod
+    def _cache_hit_result(name: str, svc: Any, stype: str, item: Any,
+                          is_tv: bool, season: Optional[int],
+                          episode: Optional[int], imdb: str,
+                          via: str, lite: bool) -> Dict[str, Any]:
+        """把缓存条目拼成与实时命中同款的结果（不含画质：缓存不同步画质字段）。"""
+        snap = getattr(item, "seasoninfo", None) or {}
+        out: Dict[str, Any] = {
+            "found": True,
+            "type": "tv" if is_tv else "movie",
+            # 服务器名：油猴详情页的「媒体服务器」行与多来源去重都靠它
+            "server": name,
+            "title": getattr(item, "title", None) or "",
+            "year": getattr(item, "year", None),
+            "item_id": getattr(item, "item_id", None),
+            # 标记结论来自缓存快照：画质/音轨要等媒体服务器可达时才补得上
+            "from_cache": True,
+            "matched_by": via if via in ("imdb", "title") else "title",
+        }
+        if lite:
+            # 浅查询：只有「在不在库里」这个结论
+            out["lite"] = True
+            return out
+        if is_tv and snap:
+            out["seasons"] = {str(k): list(v)
+                              for k, v in list(snap.items())[:_MAX_SEASONS]}
+            if season is not None:
+                out["season_in_library"] = season in snap
+                if episode is not None:
+                    eps = snap.get(season) or []
+                    out["episode"] = {"season": season, "episode": episode,
+                                      "found": episode in eps}
+                    if episode not in eps:
+                        out["reason"] = f"剧集在库，但缺 S{season:02d}E{episode:02d}"
+        if imdb:
+            out["imdb"] = imdb
+        return out
 
     def _search_server(self, name: str, stype: str, server: Any,
                        names: List[str], is_tv: bool, imdb: str,
